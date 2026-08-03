@@ -121,6 +121,7 @@ def transcribe(
     word_timestamps: bool = True,
     backend: Optional[str] = None,
     verbose: bool = False,
+    initial_prompt: Optional[str] = None,
 ) -> Result:
     """
     Один файл → транскрибат. Универсально для всех бэкендов.
@@ -131,6 +132,9 @@ def transcribe(
     word_timestamps — пословные метки (для CapCut-стиля сабов)
     backend        — "mlx" | "faster" | "whisperx" | "cpp" | None (auto)
     verbose        — печать прогресса
+    initial_prompt — подсказка модели: имена, бренды, термины. Whisper учитывает
+                     её как «предыдущий контекст» и пишет знакомые слова правильно.
+                     Лимит ~224 токена, длиннее — обрежется. Пока только backend=mlx.
     """
     audio_path = str(Path(audio_path).resolve())
     if not Path(audio_path).exists():
@@ -143,7 +147,8 @@ def transcribe(
         print(f"[whisper-skill] backend={backend} model={model_name} device={_pick_device()}")
 
     if backend == "mlx":
-        return _transcribe_mlx(audio_path, language, model_name, word_timestamps, verbose)
+        return _transcribe_mlx(audio_path, language, model_name, word_timestamps, verbose,
+                               initial_prompt)
     if backend == "faster":
         return _transcribe_faster(audio_path, language, model_name, word_timestamps, verbose)
     if backend == "whisperx":
@@ -155,7 +160,7 @@ def transcribe(
     raise ValueError(f"unknown backend: {backend}")
 
 
-def _transcribe_mlx(audio, lang, model_name, word_ts, verbose):
+def _transcribe_mlx(audio, lang, model_name, word_ts, verbose, initial_prompt=None):
     import mlx_whisper
 
     repo = (
@@ -168,6 +173,7 @@ def _transcribe_mlx(audio, lang, model_name, word_ts, verbose):
         language=lang,
         word_timestamps=word_ts,
         verbose=verbose,
+        initial_prompt=initial_prompt,
     )
     segs = [
         Segment(

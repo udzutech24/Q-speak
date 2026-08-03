@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -59,6 +60,8 @@ DEFAULT_CONFIG = {
     "show_tray": True,                   # значок в трее (если установлен pystray)
     "show_cursor_indicator": True,       # мигающая красная точка у курсора во время записи
     "cursor_indicator_color": "#ef4444", # цвет точки (CSS hex)
+    "show_hud": True,                    # macOS: панель внизу экрана с эквалайзером
+    "keep_in_clipboard": True,           # оставить надиктованное в буфере (Cmd+V куда угодно)
     "log_file": None,                    # путь к файлу лога или null = stdout
     "trim_silence_ms": 200,              # обрезать тишину в начале/конце записи
     "min_duration_ms": 300,              # игнорировать слишком короткие записи (промахи кнопкой)
@@ -238,6 +241,7 @@ class AudioRecorder:
         self._frames: list = []
         self._stream = None
         self._recording = False
+        self.level = 0.0  # текущая громкость 0..1, читает HUD
 
     def start(self) -> None:
         import sounddevice as sd
@@ -250,6 +254,9 @@ class AudioRecorder:
             if status:
                 logging.warning(f"audio status: {status}")
             self._frames.append(indata.copy())
+            # Громкость для HUD. sqrt растягивает тихую часть шкалы — на линейной
+            # RMS обычная речь еле шевелит полоски.
+            self.level = min(1.0, float(np.sqrt(np.abs(indata).mean())) * 3.0)
 
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
@@ -281,6 +288,22 @@ class AudioRecorder:
         sf.write(tmp.name, audio, self.sample_rate, subtype="PCM_16")
         return tmp.name
 
+    def snapshot(self) -> Optional[str]:
+        """Сохранить ТЕКУЩИЙ накопленный звук в WAV, НЕ останавливая запись.
+        Нужно для потоковой диктовки — промежуточного распознавания на лету."""
+        import numpy as np
+        import soundfile as sf
+
+        frames = list(self._frames)  # копия: callback пишет параллельно
+        if not frames:
+            return None
+        audio = np.concatenate(frames, axis=0)
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".wav", delete=False, prefix="vd_stream_"
+        )
+        sf.write(tmp.name, audio, self.sample_rate, subtype="PCM_16")
+        return tmp.name
+
     @property
     def duration_sec(self) -> float:
         if not self._frames:
@@ -288,6 +311,51 @@ class AudioRecorder:
         import numpy as np
         total_samples = sum(f.shape[0] for f in self._frames)
         return total_samples / self.sample_rate
+
+
+def _common_prefix_words(a: list, b: list) -> list:
+    """LocalAgreement: слова считаем «устоявшимися» только если два подряд
+    распознавания дали одинаковый префикс. Это защищает от того, что модель
+    переобдумывает concу фразы по мере поступления звука."""
+    out = []
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        out.append(x)
+    return out
+
+
+CLAUDE_BIN_CANDIDATES = [
+    "/Users/alekseya/.local/bin/claude",
+    "claude",
+]
+
+
+def ai_cleanup(text: str, timeout_sec: float = 30.0) -> str:
+    """Умная правка надиктованного через Claude CLI (как «AI mode» у Wispr Flow).
+    Работает на текущей подписке — отдельный API-ключ не нужен.
+    При любой ошибке/таймауте возвращает исходный текст (диктовка важнее правки)."""
+    prompt = (
+        "Ниже — сырой текст голосовой диктовки. Расставь пунктуацию и заглавные буквы, "
+        "убери слова-паразиты, оговорки и повторы, исправь очевидные ошибки распознавания. "
+        "НЕ меняй смысл, НЕ добавляй ничего от себя, НЕ переводи. "
+        "Верни ТОЛЬКО итоговый текст, без пояснений и кавычек.\n\n" + text
+    )
+    for binary in CLAUDE_BIN_CANDIDATES:
+        try:
+            r = subprocess.run(
+                [binary, "-p", prompt],
+                capture_output=True, text=True, timeout=timeout_sec,
+            )
+            out = (r.stdout or "").strip()
+            if out:
+                return out
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            logging.warning(f"ai_cleanup failed: {e}")
+            break
+    return text
 
 
 # ─── Text insertion ─────────────────────────────────────────────────────────
@@ -419,6 +487,133 @@ def copy_to_clipboard(text: str) -> None:
         logging.error(f"clipboard copy failed: {e}")
 
 
+def load_vocabulary() -> list:
+    """Правила из vocabulary.txt: [(правильное написание, [как слышится, ...]), ...].
+
+    Читаем на каждую диктовку: файл крошечный, зато правки подхватываются без
+    перезапуска. initial_prompt для этого не годится — проверено 2026-08-03:
+    Whisper трактует его как контекст, термины не чинит и сбивает капитализацию.
+    """
+    try:
+        p = default_config_path().parent / "vocabulary.txt"
+        if not p.exists():
+            return []
+        rules = []
+        for ln in p.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            target, variants = ln.split("=", 1)
+            forms = [v.strip() for v in variants.split(",") if v.strip()]
+            if target.strip() and forms:
+                # длинные варианты первыми: «сейф гриппи» должен сработать
+                # раньше, чем «сейф грип» съест его начало
+                rules.append((target.strip(), sorted(forms, key=len, reverse=True)))
+        return rules
+    except Exception as e:
+        logging.error(f"vocabulary read failed: {e}")
+        return []
+
+
+def apply_vocabulary(text: str, rules: list) -> str:
+    """Причесать термины после распознавания. Детерминированно, в отличие от
+    подсказок модели."""
+    for target, forms in rules:
+        for form in forms:
+            text = re.sub(rf"(?<!\w){re.escape(form)}(?!\w)", target, text,
+                          flags=re.IGNORECASE)
+    return text
+
+
+def _split_on_silence(audio, sr: int, chunk_sec: float = 28.0, search_from: float = 0.78):
+    """Нарезать длинное аудио на куски ~chunk_sec, разрезая в самом тихом месте.
+
+    Нужно для смены языка внутри записи: Whisper определяет язык по первому
+    30-секундному окну и применяет ко всей записи, поэтому английский хвост
+    длинного монолога декодируется как русский и превращается в мусор.
+    Каждый кусок распознаётся отдельно и получает свой язык.
+    """
+    import numpy as np
+
+    parts, pos, n = [], 0, len(audio)
+    step = int(chunk_sec * sr)
+    while pos < n:
+        end = pos + step
+        if end >= n:
+            parts.append(audio[pos:])
+            break
+        # Ищем паузу на всей второй половине куска, а не у самой границы:
+        # смена языка обычно совпадает с настоящей паузой, и разрез должен
+        # попасть в неё, иначе хвост чужого языка уедет в предыдущий кусок
+        # и там потеряется.
+        lo = pos + int(chunk_sec * search_from * sr)
+        hi = min(n, end)
+        win = int(0.2 * sr)
+        seg = np.abs(audio[lo:hi])
+        if len(seg) > win * 2:
+            hops = np.array([seg[i:i + win].mean()
+                             for i in range(0, len(seg) - win, win // 2)])
+            # Берём ПЕРВУЮ настоящую паузу, а не самую тихую точку: смена языка
+            # идёт сразу после неё, а глобальный минимум может оказаться паузой
+            # между фразами уже нового языка — тогда его начало съест этот кусок.
+            quiet = np.where(hops < max(hops.mean() * 0.25, 1e-4))[0]
+            k = int(quiet[0]) if len(quiet) else int(np.argmin(hops))
+            end = lo + k * (win // 2) + win // 2
+        parts.append(audio[pos:end])
+        pos = end
+    return parts
+
+
+def transcribe_long(wav_path: str, cfg: dict) -> str:
+    """Распознать запись целиком. Длинную — по кускам, чтобы каждый получил
+    свой язык. Короткую (<30с) Whisper и так тянет с переключением языка."""
+    import numpy as np
+    import soundfile as sf
+
+    lang = cfg.get("language")
+    model = cfg.get("model")
+
+    def _one(path):
+        # импорт ленивый: бэкенд выбирается из конфига до первого импорта common
+        from examples.common import transcribe
+        return transcribe(path, language=lang, model_name=model,
+                          word_timestamps=False, verbose=False).text.strip()
+
+    audio, sr = sf.read(wav_path)
+    # порог 30с — размер окна Whisper; ниже него делить нечего
+    if lang is not None or len(audio) / sr <= 30.0:
+        return _one(wav_path)
+
+    texts = []
+    for i, part in enumerate(_split_on_silence(audio, sr)):
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, prefix=f"vd_part{i}_")
+        sf.write(tmp.name, part, sr, subtype="PCM_16")
+        try:
+            t = _one(tmp.name)
+            if t:
+                texts.append(t)
+        finally:
+            try: os.unlink(tmp.name)
+            except Exception: pass
+    return " ".join(texts)
+
+
+def history_path() -> Path:
+    return default_config_path().parent / "history.md"
+
+
+def save_to_history(text: str) -> None:
+    """Дописать надиктованное в историю. Страховка от потери текста:
+    вставка может уйти не в то окно, буфер — быть перетёрт."""
+    try:
+        p = history_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(f"\n## {time.strftime('%Y-%m-%d %H:%M:%S')}\n{text}\n")
+    except Exception as e:
+        logging.error(f"history write failed: {e}")
+
+
 def save_clipboard() -> Optional[str]:
     """Снимок текстового содержимого буфера для последующего восстановления.
 
@@ -507,6 +702,37 @@ def _windows_paste() -> None:
     user32.keybd_event(VK["ctrl"], 0, KEYEVENTF_KEYUP, 0)
 
 
+def notify(text: str, title: str = "🎙 Диктовка") -> None:
+    """Нативный баннер macOS — визуальный фидбэк без терминала.
+    No-op на других ОС и при ошибке (уведомление не критично)."""
+    if platform.system() != "Darwin":
+        return
+    try:
+        safe = text.replace('"', "'").replace("\\", "")[:180]
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{safe}" with title "{title}"'],
+            check=False, capture_output=True, timeout=2,
+        )
+    except Exception:
+        pass
+
+
+def erase_chars(n: int) -> None:
+    """Стереть N символов назад — нужно, чтобы заменить черновик потоковой
+    диктовки на финальный (AI-выправленный) текст."""
+    if n <= 0:
+        return
+    try:
+        from pynput.keyboard import Controller, Key
+        kb = Controller()
+        for _ in range(n):
+            kb.press(Key.backspace)
+            kb.release(Key.backspace)
+    except Exception as e:
+        logging.error(f"erase_chars failed: {e}")
+
+
 def paste_from_clipboard() -> None:
     """Симулировать Cmd+V (Mac) или Ctrl+V (Linux/Win).
 
@@ -520,9 +746,11 @@ def paste_from_clipboard() -> None:
     # macOS: предпочитаем osascript (надёжнее с защитой Accessibility)
     if platform.system() == "Darwin":
         try:
+            # key code 9 = физическая клавиша V. НЕ зависит от раскладки
+            # (keystroke "v" при русской раскладке не находит клавишу → Cmd+V не срабатывает).
             subprocess.run(
                 ["osascript", "-e",
-                 'tell application "System Events" to keystroke "v" using command down'],
+                 'tell application "System Events" to key code 9 using command down'],
                 check=True, capture_output=True, timeout=2,
             )
             return
@@ -537,11 +765,12 @@ def paste_from_clipboard() -> None:
         if platform.system() == "Windows":
             _windows_paste()
         elif platform.system() == "Darwin":
-            from pynput.keyboard import Controller, Key
+            from pynput.keyboard import Controller, Key, KeyCode
             kb = Controller()
+            v = KeyCode.from_vk(9)  # физическая V, независимо от раскладки
             with kb.pressed(Key.cmd):
-                kb.press("v")
-                kb.release("v")
+                kb.press(v)
+                kb.release(v)
         else:
             from pynput.keyboard import Controller, Key
             kb = Controller()
@@ -682,14 +911,39 @@ def _play_wav_bytes(wav: bytes) -> None:
             logging.error(f"winsound play failed: {e}")
 
 
+# macOS: системные звуки через afplay. Синтез через sounddevice здесь не годится —
+# он конфликтует с уже открытым InputStream микрофона.
+MAC_SOUND_START = "/System/Library/Sounds/Tink.aiff"
+MAC_SOUND_STOP = "/System/Library/Sounds/Bottle.aiff"
+MAC_SOUND_DONE = "/System/Library/Sounds/Pop.aiff"
+
+
+def _play_mac_sound(path: str, volume: str = "0.6") -> None:
+    try:
+        subprocess.Popen(["afplay", "-v", volume, path],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        logging.error(f"afplay failed: {e}")
+
+
 def play_start_beep() -> None:
-    if _BEEP_WAV_START is not None:
+    if platform.system() == "Darwin":
+        _play_mac_sound(MAC_SOUND_START)
+    elif _BEEP_WAV_START is not None:
         _play_wav_bytes(_BEEP_WAV_START)
 
 
 def play_stop_beep() -> None:
-    if _BEEP_WAV_STOP is not None:
+    if platform.system() == "Darwin":
+        _play_mac_sound(MAC_SOUND_STOP)
+    elif _BEEP_WAV_STOP is not None:
         _play_wav_bytes(_BEEP_WAV_STOP)
+
+
+def play_done_beep() -> None:
+    """Третий сигнал — текст вставлен, можно продолжать."""
+    if platform.system() == "Darwin":
+        _play_mac_sound(MAC_SOUND_DONE, volume="0.4")
 
 
 def play_dual_beep(f1: int, f2: int, dur_ms: int = 60, gap_ms: int = 40) -> None:
@@ -933,7 +1187,17 @@ def main_loop(cfg: dict, cfg_path: Path):
     # Optional — silently disables if Tk unavailable. На macOS всегда no-op
     # (см. scripts/cursor_indicator.py — Tk thread-safety issue).
     cursor_ind = None
-    if cfg.get("show_cursor_indicator", True) and not is_mac_low_cpu:
+    if platform.system() == "Darwin" and cfg.get("show_hud", True):
+        # На macOS Tk-индикатор не работает (main-thread), поэтому отдельный
+        # процесс с Cocoa-панелью внизу экрана.
+        try:
+            from scripts.hud_mac import MacHUD
+            cursor_ind = MacHUD()
+            cursor_ind.start()
+        except Exception as e:
+            logging.error(f"macOS HUD init failed: {e}")
+            cursor_ind = None
+    elif cfg.get("show_cursor_indicator", True) and not is_mac_low_cpu:
         try:
             from scripts.cursor_indicator import CursorIndicator
             cursor_ind = CursorIndicator(color=cfg.get("cursor_indicator_color", "#ef4444"))
@@ -941,6 +1205,51 @@ def main_loop(cfg: dict, cfg_path: Path):
         except Exception as e:
             logging.error(f"cursor indicator init failed: {e}")
             cursor_ind = None
+
+    # Состояние потоковой диктовки: что уже вставлено в поле по ходу речи.
+    stream_state = {"emitted": "", "prev_words": []}
+
+    def _stream_worker():
+        """Пока идёт запись — периодически распознаём накопленный звук быстрой
+        моделью и дописываем в поле только «устоявшиеся» слова (LocalAgreement)."""
+        interval = float(cfg.get("stream_interval_sec", 1.8))
+        fast_model = cfg.get("stream_model", "mlx-community/whisper-large-v3-turbo")
+        while True:
+            time.sleep(interval)
+            if not state.is_recording:
+                return
+            wav = recorder.snapshot()
+            if not wav:
+                print("[stream] нет аудио в снапшоте", flush=True)
+                continue
+            try:
+                res = transcribe(
+                    wav, language=cfg.get("language"), model_name=fast_model,
+                    word_timestamps=False, verbose=False,
+                )
+                words = apply_vocabulary(res.text.strip(), load_vocabulary()).split()
+                print(f"[stream] снапшот → {len(words)} слов: {' '.join(words)[:80]}", flush=True)
+            except Exception as e:
+                print(f"[stream] transcribe FAILED: {e}", flush=True)
+                continue
+            finally:
+                try: os.unlink(wav)
+                except Exception: pass
+
+            if not state.is_recording:
+                return
+            stable = _common_prefix_words(stream_state["prev_words"], words)
+            stream_state["prev_words"] = words
+            already = stream_state["emitted"].split()
+            if len(stable) > len(already):
+                delta = " ".join(stable[len(already):])
+                if delta:
+                    chunk = (" " if stream_state["emitted"] else "") + delta
+                    copy_to_clipboard(chunk)
+                    paste_from_clipboard()
+                    stream_state["emitted"] = (
+                        stream_state["emitted"] + chunk if stream_state["emitted"] else delta
+                    )
 
     def start_recording():
         with state_lock:
@@ -954,7 +1263,19 @@ def main_loop(cfg: dict, cfg_path: Path):
             threading.Thread(target=play_start_beep, daemon=True).start()
         try:
             recorder.start()
+            if cursor_ind and hasattr(cursor_ind, "set_level"):
+                def _feed_level():
+                    while state.is_recording:
+                        cursor_ind.set_level(recorder.level)
+                        time.sleep(1 / 25)
+                threading.Thread(target=_feed_level, daemon=True).start()
             print("🎙  Recording... (release hotkey to transcribe)")
+            if cfg.get("show_notification", True):
+                threading.Thread(target=notify, args=("Слушаю… (тап ⌥ чтобы закончить)",), daemon=True).start()
+            if cfg.get("streaming", False):
+                stream_state["emitted"] = ""
+                stream_state["prev_words"] = []
+                threading.Thread(target=_stream_worker, daemon=True).start()
         except Exception as e:
             print(f"❌ Recording failed: {e}")
             state.is_recording = False
@@ -1005,20 +1326,48 @@ def main_loop(cfg: dict, cfg_path: Path):
                     print("⏳ Waiting for model warmup to finish...")
                     warmup_done.wait()
                 t0 = time.time()
-                result = transcribe(
-                    wav_path,
-                    language=cfg.get("language"),
-                    model_name=cfg.get("model"),
-                    word_timestamps=False,
-                    verbose=False,
-                )
-                text = result.text.strip()
+                text = apply_vocabulary(transcribe_long(wav_path, cfg), load_vocabulary())
                 elapsed = time.time() - t0
 
                 if not text:
                     print("⏭  Empty transcription")
                 else:
                     print(f"✓ ({elapsed:.1f}s) → {text}")
+                    # Пишем в историю ДО вставки: если фокус ушёл не туда или
+                    # вставка сорвалась — текст всё равно не потерян.
+                    save_to_history(text)
+
+                    # AI-правка (аналог «AI mode» у Wispr Flow): пунктуация,
+                    # заглавные, чистка оговорок. Смысл не меняется.
+                    if cfg.get("ai_cleanup", False):
+                        polished = ai_cleanup(text, cfg.get("ai_timeout_sec", 30.0)).strip()
+                        if polished:
+                            if polished != text:
+                                print(f"✎ AI → {polished}")
+                            text = polished
+
+                    if cfg.get("show_notification", True):
+                        threading.Thread(target=notify, args=(text, "✓ Вставлено"), daemon=True).start()
+
+                    streamed = stream_state.get("emitted", "")
+                    if streamed:
+                        # Потоковый режим: черновик уже в поле — стираем его и
+                        # кладём финальный текст одним куском.
+                        saved_clipboard = save_clipboard() if cfg.get("auto_paste") else None
+                        if cfg.get("auto_paste"):
+                            erase_chars(len(streamed))
+                            copy_to_clipboard(text)
+                            time.sleep(0.15)
+                            paste_from_clipboard()
+                            if not cfg.get("keep_in_clipboard", True):
+                                restore_clipboard_deferred(saved_clipboard, delay_sec=1.0)
+                        else:
+                            copy_to_clipboard(text)
+                        stream_state["emitted"] = ""
+                        stream_state["prev_words"] = []
+                        state.last_dictation_at = time.time()
+                        return
+
                     # Если предыдущая диктовка была недавно — начинаем
                     # новую с переноса строки. Порог 30s — «продолжаем
                     # в то же место»; после большой паузы вставка чистая.
@@ -1034,11 +1383,14 @@ def main_loop(cfg: dict, cfg_path: Path):
                     if cfg.get("auto_paste"):
                         time.sleep(0.25)  # дать целевому полю стать активным
                         paste_from_clipboard()
-                        # Восстанавливаем буфер асинхронно через 1с —
-                        # таргет должен успеть обработать WM_PASTE и
-                        # прочитать диктованный текст до того, как мы
-                        # вернём оригинал.
-                        restore_clipboard_deferred(saved_clipboard, delay_sec=1.0)
+                        # keep_in_clipboard: диктованный текст остаётся в буфере,
+                        # чтобы вставить его Cmd+V куда угодно, если фокус ушёл
+                        # не туда. Иначе — возвращаем прежнее содержимое буфера
+                        # (асинхронно через 1с, чтобы таргет успел обработать вставку).
+                        if not cfg.get("keep_in_clipboard", True):
+                            restore_clipboard_deferred(saved_clipboard, delay_sec=1.0)
+                    if cfg.get("play_sound"):
+                        threading.Thread(target=play_done_beep, daemon=True).start()
                     state.last_dictation_at = now
             except Exception as e:
                 print(f"❌ Transcription failed: {e}")
@@ -1065,35 +1417,46 @@ def main_loop(cfg: dict, cfg_path: Path):
     print(f"   Язык:   {cfg.get('language') or 'auto'}")
     print(f"\nНажми {hotkey_str} чтобы говорить. Ctrl+C чтобы выйти.\n")
 
+    # Оба режима — через один Listener. GlobalHotKeys в pynput не ловит одиночный
+    # модификатор (напр. правый Option), поэтому toggle тоже отслеживаем сами.
+    keys_needed = _parse_hotkey(hotkey_str)
+    currently_pressed = set()
+
     if cfg["mode"] == "ptt":
         # Push-to-talk: нажал → запись, отпустил → транскрибировать
-        # У pynput GlobalHotKeys работает по нажатию. Для PTT отслеживаем сами через Listener.
-        keys_needed = _parse_hotkey(hotkey_str)
-        currently_pressed = set()
-
         def on_press(key):
-            currently_pressed.add(_canonical_key(key))
+            currently_pressed.update(_canonical_keys(key))
             if keys_needed.issubset(currently_pressed):
                 start_recording()
 
         def on_release(key):
-            ck = _canonical_key(key)
-            if ck in keys_needed and state.is_recording:
+            names = _canonical_keys(key)
+            if (names & keys_needed) and state.is_recording:
                 stop_and_transcribe()
-            currently_pressed.discard(ck)
-
-        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-            try:
-                listener.join()
-            except KeyboardInterrupt:
-                pass
+            currently_pressed.difference_update(names)
     else:
-        # Toggle: нажал → старт, нажал ещё раз → стоп
-        with keyboard.GlobalHotKeys({hotkey_str: toggle}) as listener:
-            try:
-                listener.join()
-            except KeyboardInterrupt:
-                pass
+        # Toggle: тап → старт, тап ещё раз → стоп. Срабатываем на ФРОНТЕ нажатия
+        # (armed), чтобы автоповтор/удержание не переключали запись многократно.
+        armed = {"v": True}
+
+        def on_press(key):
+            was = keys_needed.issubset(currently_pressed)
+            currently_pressed.update(_canonical_keys(key))
+            now = keys_needed.issubset(currently_pressed)
+            if now and not was and armed["v"]:
+                armed["v"] = False
+                toggle()
+
+        def on_release(key):
+            currently_pressed.difference_update(_canonical_keys(key))
+            if not keys_needed.issubset(currently_pressed):
+                armed["v"] = True
+
+    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+        try:
+            listener.join()
+        except KeyboardInterrupt:
+            pass
 
     print("\n👋 Bye")
     return 0
@@ -1127,6 +1490,24 @@ def _canonical_key(key) -> str:
             return key.char.lower()
         return str(key)
     return str(key).lower()
+
+
+def _canonical_keys(key) -> set:
+    """Как _canonical_key, но возвращает МНОЖЕСТВО имён-кандидатов.
+    Для side-specific модификаторов даёт и точное, и общее имя:
+    Key.alt_r → {"alt_r", "alt"}. Тогда хоткей '<alt_r>' (только правый)
+    и '<alt>' (любой) оба матчатся корректно."""
+    from pynput.keyboard import Key, KeyCode
+    if isinstance(key, Key):
+        name = key.name          # напр. 'alt_r'
+        names = {name}
+        for suffix in ("_l", "_r"):
+            if name.endswith(suffix):
+                names.add(name[:-2])   # общее 'alt'
+        return names
+    if isinstance(key, KeyCode):
+        return {key.char.lower()} if key.char else {str(key)}
+    return {str(key).lower()}
 
 
 # ─── Entry point ────────────────────────────────────────────────────────────
@@ -1256,10 +1637,19 @@ def _check_macos_accessibility() -> bool:
         ApplicationServices = ctypes.cdll.LoadLibrary(
             "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
         )
-        # Берём без options → не показываем системный prompt (он мигает и пропадает,
-        # пользователю всё равно не понятно что делать)
         ApplicationServices.AXIsProcessTrusted.restype = c_bool
         trusted = ApplicationServices.AXIsProcessTrusted()
+        if not trusted:
+            # Просим систему показать свой запрос: она сама заведёт запись с
+            # правильной подписью бандла. Ручное добавление в список после
+            # правки бандла (смена иконки) не срабатывает — запись остаётся
+            # привязанной к прежней версии.
+            try:
+                import HIServices
+                HIServices.AXIsProcessTrustedWithOptions(
+                    {"AXTrustedCheckOptionPrompt": True})
+            except Exception as e:
+                logging.debug(f"AX prompt failed: {e}")
     except Exception as e:
         # Если не удалось проверить — не блокируем запуск (пусть pynput сам разберётся)
         logging.debug(f"AX trust check failed: {e}")
