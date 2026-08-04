@@ -245,6 +245,16 @@ def setup_wizard():
 # ─── Audio recording ────────────────────────────────────────────────────────
 
 
+def _close_stream(stream) -> None:
+    """Закрыть аудиопоток. Вызывается в отдельном потоке — на мёртвом
+    устройстве оба вызова могут не вернуться никогда."""
+    try:
+        stream.stop()
+        stream.close()
+    except Exception as e:
+        logging.warning(f"stream close failed: {e}")
+
+
 class AudioRecorder:
     def __init__(self, sample_rate: int = 16000, channels: int = 1):
         self.sample_rate = sample_rate
@@ -303,9 +313,18 @@ class AudioRecorder:
         if not self._recording or not self._stream:
             return None
         self._recording = False
-        self._stream.stop()
-        self._stream.close()
-        self._stream = None
+        stream, self._stream = self._stream, None
+
+        # Отвалившийся вход (USB-микрофон вебкамеры, смена устройства) оставляет
+        # CoreAudio висеть в stop()/close() бесконечно, а зовут нас из потока
+        # хоткея — вместе с ним умирает приём клавиш (инцидент 04.08.2026).
+        # Ждём 2 с и уходим с уже накопленными кадрами: следующий start()
+        # поймает ошибку открытия и переинициализирует PortAudio.
+        closer = threading.Thread(target=_close_stream, args=(stream,), daemon=True)
+        closer.start()
+        closer.join(timeout=2.0)
+        if closer.is_alive():
+            print("⚠️  Микрофон не закрылся за 2 с — продолжаю без него")
 
         if not self._frames:
             return None
@@ -1321,13 +1340,18 @@ def main_loop(cfg: dict, cfg_path: Path):
             already = stream_state["emitted"].split()
             if len(stable) > len(already):
                 delta = " ".join(stable[len(already):])
-                if delta:
+                # Расшифровка снапшота небыстрая: за это время запись могли
+                # отменить. Вставлять черновик после отмены — мусор в поле.
+                if delta and state.is_recording:
                     chunk = (" " if stream_state["emitted"] else "") + delta
                     copy_to_clipboard(chunk)
                     paste_from_clipboard()
                     stream_state["emitted"] = (
                         stream_state["emitted"] + chunk if stream_state["emitted"] else delta
                     )
+
+    auto_stop = {"t": None}   # сторожевой таймер записи, max_duration_sec
+    cancelled = {"v": False}  # отмена, пойманная уже во время расшифровки
 
     def start_recording():
         if not menu_state["enabled"]:   # тумблер в меню — глушим на входе, а не в каждом хоткее
@@ -1343,6 +1367,13 @@ def main_loop(cfg: dict, cfg_path: Path):
             threading.Thread(target=play_start_beep, daemon=True).start()
         try:
             recorder.start()
+            # Ключ max_duration_sec до сих пор был мёртвым: в конфиге есть,
+            # в коде не использовался. Страховка от «нажал и ушёл».
+            limit = float(cfg.get("max_duration_sec") or 0)
+            if limit > 0:
+                auto_stop["t"] = threading.Timer(limit, stop_and_transcribe)
+                auto_stop["t"].daemon = True
+                auto_stop["t"].start()
             if cursor_ind and hasattr(cursor_ind, "set_level"):
                 def _feed_level():
                     while state.is_recording:
@@ -1363,11 +1394,43 @@ def main_loop(cfg: dict, cfg_path: Path):
             if cursor_ind:
                 cursor_ind.hide()
 
+    def cancel_recording():
+        """Передумал: выбросить запись, ничего не расшифровывать, черновик
+        стриминга стереть из поля. Esc во время записи или крестик на HUD."""
+        with state_lock:
+            if not state.is_recording:
+                # расшифровка уже идёт — прервать mlx нельзя, но результат
+                # можно выбросить: он останется только в истории
+                if state.is_transcribing:
+                    cancelled["v"] = True
+                    print("✖ Отменяю расшифровку")
+                return
+            state.is_recording = False
+        if auto_stop["t"]:
+            auto_stop["t"].cancel()
+            auto_stop["t"] = None
+        wav_path = recorder.stop()
+        streamed = stream_state.get("emitted", "")
+        if streamed and cfg.get("auto_paste"):
+            erase_chars(len(streamed))
+        stream_state["emitted"] = ""
+        stream_state["prev_words"] = []
+        if wav_path:
+            try: os.unlink(wav_path)
+            except OSError: pass
+        tray.set_state("idle")
+        if cursor_ind:
+            cursor_ind.hide()
+        print("✖ Запись отменена")
+
     def stop_and_transcribe():
         with state_lock:
             if not state.is_recording:
                 return
             state.is_recording = False
+        if auto_stop["t"]:
+            auto_stop["t"].cancel()
+            auto_stop["t"] = None
         tray.set_state("transcribing")
         # Точка → катушка ровно в той же позиции возле курсора. Скрываем
         # индикатор только когда текст уже вставлен (в work() finally) или
@@ -1417,6 +1480,16 @@ def main_loop(cfg: dict, cfg_path: Path):
                     # вставка сорвалась — текст всё равно не потерян.
                     save_to_history(text)
                     save_last_take(wav_path, text)
+
+                    if cancelled["v"]:
+                        cancelled["v"] = False
+                        draft = stream_state.get("emitted", "")
+                        if draft and cfg.get("auto_paste"):
+                            erase_chars(len(draft))
+                        stream_state["emitted"] = ""
+                        stream_state["prev_words"] = []
+                        print("✖ Отменено — текст остался только в истории")
+                        return
 
                     # AI-правка (аналог «AI mode» у Wispr Flow): пунктуация,
                     # заглавные, чистка оговорок. Смысл не меняется.
@@ -1510,9 +1583,13 @@ def main_loop(cfg: dict, cfg_path: Path):
             except Exception as e:
                 logging.error(f"config write failed: {e}")
             print(f"🎛 {key} → {val}")
-            if key == "model":
-                print("🔁 Перезапуск под новую модель...")
+            if key in ("model", "hotkey"):
+                # листенер клавиш собран на старте под конкретный хоткей,
+                # модель держится в памяти — и то и другое меняется перезапуском
+                print(f"🔁 Перезапуск: {key} изменён...")
                 restart_self()
+        elif cmd == "cancel":
+            cancel_recording()
         elif cmd == "paste_last":
             text = last_history_entry()
             if text:
@@ -1556,6 +1633,9 @@ def main_loop(cfg: dict, cfg_path: Path):
         armed = {"v": True}
 
         def on_press(key):
+            if key == keyboard.Key.esc and (state.is_recording or state.is_transcribing):
+                cancel_recording()
+                return
             was = keys_needed.issubset(currently_pressed)
             currently_pressed.update(_canonical_keys(key))
             now = keys_needed.issubset(currently_pressed)

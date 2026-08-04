@@ -26,12 +26,14 @@ import sys
 import threading
 import time
 
-PANEL_W, PANEL_H = 190.0, 52.0
+PANEL_W, PANEL_H = 156.0, 40.0
 BOTTOM_MARGIN = 96.0
 RISE = 16.0                       # на сколько панель выезжает снизу при показе
-N_BARS = 7
-BAR_W, BAR_GAP = 5.0, 6.0
-BAR_MIN, BAR_MAX = 5.0, 28.0
+N_BARS = 9
+BAR_W, BAR_GAP = 3.5, 4.0
+BAR_MIN, BAR_MAX = 3.0, 25.0
+CANCEL_ZONE = 30.0                # правый край пилюли — крестик «отменить»
+ANIM_SEC = 0.22                   # выезд/уход пилюли, секунды
 ACCENT_A = (0.10, 1.00, 0.55)     # сочный зелёный — левый край градиента
 ACCENT_B = (0.25, 0.95, 0.85)     # бирюза — правый край
 ACCENT_WORK = (0.45, 0.80, 1.00)  # голубой — расшифровываем
@@ -42,6 +44,16 @@ HISTORY_FILE = os.path.join(CFG_DIR, "history.md")
 VOCAB_FILE = os.path.join(CFG_DIR, "vocabulary.txt")
 
 LANGS = [("Авто", "auto"), ("Русский", "ru"), ("English", "en")]
+# Одиночные модификаторы удобнее всего: не конфликтуют с горячими клавишами
+# приложений. Формат — как в _parse_hotkey родителя.
+# ⚠️ Левых вариантов тут нет намеренно: pynput на macOS отдаёт левый модификатор
+# как общий ('alt', не 'alt_l'), поэтому «<alt_l>» не сработал бы никогда.
+HOTKEYS = [("Правый ⌥ Option", "<alt_r>"),
+           ("Правый ⌘ Command", "<cmd_r>"),
+           ("Правый ⌃ Control", "<ctrl_r>"),
+           ("Любой ⌥ Option", "<alt>"),
+           ("F13", "<f13>"),
+           ("⌃ + Пробел", "<ctrl>+<space>")]
 MODELS = [("large-v3 (точная)", "mlx-community/whisper-large-v3-mlx"),
           ("large-v3-turbo (быстрая)", "mlx-community/whisper-large-v3-turbo")]
 # Средняя скорость: слепой набор ~40 слов/мин, речь ~130. Разница = экономия.
@@ -125,11 +137,13 @@ def _run_child() -> int:
         NSWindowCollectionBehaviorStationary,
         NSWindowStyleMaskBorderless, NSWindowStyleMaskNonactivatingPanel,
     )
-    from Foundation import NSMakeRect, NSMakePoint, NSObject
+    from Foundation import (
+        NSMakeRect, NSMakePoint, NSObject, NSRunLoop, NSRunLoopCommonModes)
     import objc
 
-    state = {"mode": "hidden", "level": 0.0, "smooth": 0.0, "shown": 0.0, "t": 0.0,
-             "enabled": True, "title": ""}
+    state = {"mode": "hidden", "level": 0.0, "smooth": 0.0, "p": 0.0, "t": 0.0,
+             "enabled": True, "title": "", "bars": [0.0] * N_BARS,
+             "cancel_click": False, "peak": 0.05, "last_tick": time.time()}
 
     class HUDView(NSView):
         def drawRect_(self, rect):
@@ -151,47 +165,69 @@ def _run_child() -> int:
             body.setLineWidth_(1.6)
             body.stroke()
 
+            # эквалайзер живёт слева от крестика, поэтому центрируем не по всей
+            # ширине, а по свободной части
+            field_w = w - CANCEL_ZONE
+
             if mode == "recording":
-                # эквалайзер: сглаженная громкость × собственная фаза каждого
-                # столбика — синхронные полоски выглядят мёртво
+                # высоты столбиков считает Ticker (быстрый рост, ленивый спад) —
+                # здесь только рисуем: пики держатся, спад плавный, как у железных
+                # эквалайзеров
                 lvl = max(0.0, min(1.0, state["smooth"]))
                 total = N_BARS * BAR_W + (N_BARS - 1) * BAR_GAP
-                x = (w - total) / 2
+                x = (field_w - total) / 2
                 for i in range(N_BARS):
                     k = i / (N_BARS - 1)
                     r = ACCENT_A[0] + (ACCENT_B[0] - ACCENT_A[0]) * k
                     g = ACCENT_A[1] + (ACCENT_B[1] - ACCENT_A[1]) * k
                     b = ACCENT_A[2] + (ACCENT_B[2] - ACCENT_A[2]) * k
-                    # бегущая волна: фаза сдвинута по позиции, поэтому гребень
-                    # идёт слева направо, а не все столбики прыгают разом
-                    wave = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(t * 7.0 - k * 4.2))
-                    # центральные столбики выше крайних — форма «холма»
-                    shape = 0.55 + 0.45 * math.sin(math.pi * k)
-                    bh = BAR_MIN + (BAR_MAX - BAR_MIN) * lvl * wave * shape
+                    bh = BAR_MIN + (BAR_MAX - BAR_MIN) * state["bars"][i]
                     bar = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
                         NSMakeRect(x, (h - bh) / 2, BAR_W, bh), BAR_W / 2, BAR_W / 2)
                     NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                        r, g, b, 0.75 + 0.25 * lvl).setFill()
+                        r, g, b, 0.70 + 0.30 * state["bars"][i]).setFill()
                     bar.fill()
                     x += BAR_W + BAR_GAP
             else:
                 # расшифровка: те же столбики, но по ним переливается блик —
                 # видно, что работа идёт, а форма плашки не скачет
                 total = N_BARS * BAR_W + (N_BARS - 1) * BAR_GAP
-                x = (w - total) / 2
+                x = (field_w - total) / 2
                 for i in range(N_BARS):
                     k = i / (N_BARS - 1)
                     # гребень бежит по кругу; чем ближе столбик к нему, тем ярче и выше
                     d = abs(((t * 0.9 - k) % 1.0) - 0.0)
                     d = min(d, 1.0 - d)             # расстояние по кольцу
                     pulse = max(0.0, 1.0 - d * 3.2)
-                    bh = BAR_MIN + 12.0 * pulse
+                    bh = BAR_MIN + 10.0 * pulse
                     bar = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
                         NSMakeRect(x, (h - bh) / 2, BAR_W, bh), BAR_W / 2, BAR_W / 2)
                     NSColor.colorWithCalibratedRed_green_blue_alpha_(
                         ar, ag, ab, 0.30 + 0.70 * pulse).setFill()
                     bar.fill()
                     x += BAR_W + BAR_GAP
+
+            # крестик «отменить»: и во время записи, и во время расшифровки —
+            # чтобы не ждать результат, который уже не нужен
+            cx, cy, rr = w - CANCEL_ZONE / 2 - 4, h / 2, 5.0
+            ring = NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(cx - rr - 4, cy - rr - 4, (rr + 4) * 2, (rr + 4) * 2))
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.09).setFill()
+            ring.fill()
+            cross = NSBezierPath.bezierPath()
+            cross.moveToPoint_(NSMakePoint(cx - rr / 1.6, cy - rr / 1.6))
+            cross.lineToPoint_(NSMakePoint(cx + rr / 1.6, cy + rr / 1.6))
+            cross.moveToPoint_(NSMakePoint(cx - rr / 1.6, cy + rr / 1.6))
+            cross.lineToPoint_(NSMakePoint(cx + rr / 1.6, cy - rr / 1.6))
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.55, 0.5, 0.8).setStroke()
+            cross.setLineWidth_(1.8)
+            cross.setLineCapStyle_(1)
+            cross.stroke()
+
+        def mouseDown_(self, event):
+            p = self.convertPoint_fromView_(event.locationInWindow(), None)
+            if p.x >= self.bounds().size.width - CANCEL_ZONE:
+                state["cancel_click"] = True
 
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
@@ -237,6 +273,9 @@ def _run_child() -> int:
         def pickModel_(self, sender):
             _emit(f"set model {sender.representedObject()}")
 
+        def pickHotkey_(self, sender):
+            _emit(f"set hotkey {sender.representedObject()}")
+
         def toggleSounds_(self, sender):
             _emit(f"set play_sound {0 if _read_cfg().get('play_sound', True) else 1}")
 
@@ -274,6 +313,8 @@ def _run_child() -> int:
                 it.setState_(1 if (cfg.get("language") or "auto") == it.representedObject() else 0)
             for it in mi["models"]:
                 it.setState_(1 if cfg.get("model") == it.representedObject() else 0)
+            for it in mi["hotkeys"]:
+                it.setState_(1 if cfg.get("hotkey") == it.representedObject() else 0)
 
     target = MenuTarget.alloc().init()
 
@@ -307,6 +348,7 @@ def _run_child() -> int:
     menu.addItem_(mi["onoff"])
     mi["langs"] = _submenu(menu, "Язык", LANGS, "pickLang:")
     mi["models"] = _submenu(menu, "Модель", MODELS, "pickModel:")
+    mi["hotkeys"] = _submenu(menu, "Кнопка диктовки", HOTKEYS, "pickHotkey:")
     menu.addItem_(mi["sounds"])
     menu.addItem_(NSMenuItem.separatorItem())
     menu.addItem_(_item("Вставить последнее", "pasteLast:"))
@@ -348,34 +390,66 @@ def _run_child() -> int:
             if state["mode"] == "quit":
                 app.terminate_(None)
                 return
-            state["t"] += 1 / 30
+            # шаг по реальному времени: таймер иногда пропускает кадры, и на
+            # фиксированном 1/30 анимация дёргалась ровно в эти моменты
+            now = time.time()
+            dt = min(0.1, now - state["last_tick"])
+            state["last_tick"] = now
+            state["t"] += dt
             # значок в баре меняется только на главном потоке — отсюда, не из stdin
             want_title = {"recording": "🔴", "transcribing": "⏳"}.get(
                 state["mode"], "🎙" if state["enabled"] else "⏸")
             if want_title != state["title"]:
                 state["title"] = want_title
                 status_item.button().setTitle_(want_title)
+            if state["cancel_click"]:
+                state["cancel_click"] = False
+                _emit("cancel")
             # сглаживание громкости: сырой RMS дёргается и полоски мельтешат
-            state["smooth"] += (state["level"] - state["smooth"]) * 0.35
+            state["smooth"] += (state["level"] - state["smooth"]) * 0.45
+            lvl = max(0.0, min(1.0, state["smooth"]))
+            # авто-усиление: тихая речь давала размах в пару пикселей. Нормируем
+            # на недавний максимум (он сам медленно оседает) — полный размах на
+            # любом голосе, а не только на крике в микрофон.
+            state["peak"] = max(lvl, state["peak"] * 0.94)
+            norm = (min(1.0, lvl / max(state["peak"], 0.04))) ** 0.65
+            drive = 0.18 + 0.82 * norm      # 0.18 — столбики дышат и в тишине
+            # каждый столбик живёт сам: вверх прыгает почти мгновенно, вниз
+            # оседает лениво — от этого движение «дышит», а не мерцает
+            for i in range(N_BARS):
+                k = i / (N_BARS - 1)
+                wave = 0.45 + 0.55 * (0.5 + 0.5 * math.sin(state["t"] * 9.0 - k * 4.6))
+                shape = 0.55 + 0.45 * math.sin(math.pi * k)   # холм: центр выше краёв
+                target = min(1.0, drive * wave * shape * 1.35)
+                cur = state["bars"][i]
+                state["bars"][i] = cur + (target - cur) * (0.7 if target > cur else 0.14)
+
+            # Появление/исчезновение по времени, не «процент за кадр»: экспонента
+            # давала первый скачок сразу на четверть пути — он и читался как рывок.
             want = 0.0 if state["mode"] == "hidden" else 1.0
-            # плавное появление/угасание — резкий показ выглядит дёшево
-            state["shown"] += (want - state["shown"]) * 0.25
-            if abs(state["shown"] - want) < 0.01:
-                state["shown"] = want
-            panel.setAlphaValue_(state["shown"])
-            if state["shown"] > 0.01:
-                if not panel.isVisible():
-                    panel.orderFrontRegardless()
-                # выезд снизу вместе с проявлением
-                panel.setFrameOrigin_(NSMakePoint(
-                    frame.origin.x, BOTTOM_MARGIN - RISE * (1.0 - state["shown"])))
+            step = dt / ANIM_SEC
+            state["p"] = max(0.0, min(1.0, state["p"] + (step if want else -step)))
+            p = state["p"]
+            e = p * p * (3.0 - 2.0 * p)      # smoothstep: мягкий старт и мягкий конец
+            panel.setAlphaValue_(e)
+            # мышь ловим только пока пилюля на экране — иначе она бы съедала
+            # клики по пустому месту у дока
+            panel.setIgnoresMouseEvents_(state["mode"] == "hidden")
+            # окно не прячем через orderOut: первый кадр после показа стоил
+            # заметного подтормаживания. Невидимая панель с alpha 0 не мешает.
+            panel.setFrameOrigin_(NSMakePoint(
+                frame.origin.x, BOTTOM_MARGIN - RISE * (1.0 - e)))
+            if p > 0.0:
                 view.setNeedsDisplay_(True)
-            elif panel.isVisible():
-                panel.orderOut_(None)
 
     ticker = Ticker.alloc().init()
-    NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-        1 / 30, ticker, objc.selector(ticker.tick_, signature=b"v@:@"), None, True)
+    timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+        1 / 60, ticker, objc.selector(ticker.tick_, signature=b"v@:@"), None, True)
+    # Без common modes таймер замирает, пока открыто меню или идёт скролл —
+    # это и был «затык» на выезде пилюли. И один раз показываем окно, дальше
+    # видимостью управляет alpha.
+    NSRunLoop.currentRunLoop().addTimer_forMode_(timer, NSRunLoopCommonModes)
+    panel.orderFrontRegardless()
     app.run()
     return 0
 
@@ -492,6 +566,20 @@ def _selftest() -> None:
     assert stats_today("/нет/такого", today="x").startswith("Сегодня: истории нет")
     os.unlink(f.name)
     print("ok:", out)
+
+    # Каждый пункт «Кнопка диктовки» обязан реально ловиться слушателем: выбрать
+    # в меню хоткей, который pynput не отдаёт (напр. левый ⌥), = молча остаться
+    # без диктовки.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from examples.voice_dictation import _parse_hotkey, _canonical_keys
+    from pynput.keyboard import Key
+    for label, value in HOTKEYS:
+        need = _parse_hotkey(value)
+        for part in need:
+            key = getattr(Key, part, None)
+            if key is not None:      # модификаторы и F-клавиши, не буквы
+                assert part in _canonical_keys(key), f"{label}: {part} не ловится"
+    print(f"ok: все {len(HOTKEYS)} вариантов хоткея распознаются")
 
 
 if __name__ == "__main__":
