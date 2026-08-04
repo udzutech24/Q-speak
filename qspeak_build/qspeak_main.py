@@ -4,6 +4,14 @@ import sys, os, multiprocessing
 # скилла, поэтому корень скилла берётся от него, а не хардкодится.
 SKILL = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
+# mlx_whisper зовёт ffmpeg через PATH, а PATH зависит от способа запуска:
+# launchd берёт его из plist, а вот запуск из Finder/Spotlight/Dock даёт
+# урезанный GUI-PATH без homebrew — и расшифровка падает на «ffmpeg not found».
+# Дописываем сами, чтобы приложение не зависело от того, как его подняли.
+for _bin in ("/opt/homebrew/bin", "/usr/local/bin"):
+    if os.path.isdir(_bin) and _bin not in os.environ.get("PATH", "").split(":"):
+        os.environ["PATH"] = _bin + ":" + os.environ.get("PATH", "")
+
 # КРИТИЧНО для py2app: под бандлом sys.executable = сам QSpeak.app. Любой
 # multiprocessing/hf-download через spawn иначе перезапускает приложение,
 # ловит single-instance lock и роняет главный процесс. Направляем воркеров
