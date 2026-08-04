@@ -201,14 +201,14 @@ def restart_self() -> None:
                 close_fds=True,
             )
     elif getattr(sys, "frozen", None) == "macosx_app" and Path(
-            "~/Library/LaunchAgents/com.kspeak.dictation.plist").expanduser().exists():
-        # Под py2app sys.executable — сам бандл K-speak: запустить его с
+            "~/Library/LaunchAgents/com.qspeak.dictation.plist").expanduser().exists():
+        # Под py2app sys.executable — сам бандл QSpeak: запустить его с
         # "-m examples.voice_dictation" нельзя, argparse упадёт на этих
         # аргументах и приложение не поднимется. Перезапуск отдаём launchd —
         # он же вернёт правильный PATH с homebrew (иначе ffmpeg not found).
         subprocess.Popen(
             ["/bin/sh", "-c",
-             f"sleep 1; launchctl kickstart -k gui/{os.getuid()}/com.kspeak.dictation"],
+             f"sleep 1; launchctl kickstart -k gui/{os.getuid()}/com.qspeak.dictation"],
             start_new_session=True, close_fds=True,
         )
     else:

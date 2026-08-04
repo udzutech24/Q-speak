@@ -90,7 +90,7 @@ def save_correction() -> str:
     # разборе. Переводы строк тоже недопустимы внутри его строкового литерала.
     shown = json.dumps(last["asr"].replace("\n", " "), ensure_ascii=False)
     script = ('display dialog "Что было сказано на самом деле?" '
-              f'default answer {shown} with title "K-speak" '
+              f'default answer {shown} with title "QSpeak" '
               'buttons {"Отмена", "Сохранить"} default button "Сохранить"')
     r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     if r.returncode != 0:                       # Отмена
@@ -457,15 +457,15 @@ def _run_child() -> int:
 # ─── родитель: обёртка с API как у CursorIndicator ──────────────────────────
 
 def real_python() -> str:
-    """Под py2app sys.executable — сам бандл K-speak, дочерний процесс так не поднять.
+    """Под py2app sys.executable — сам бандл QSpeak, дочерний процесс так не поднять.
 
-    Порядок: KSPEAK_PYTHON из окружения (его пишет install.sh в LaunchAgent) →
+    Порядок: QSPEAK_PYTHON из окружения (его пишет install.sh в LaunchAgent) →
     интерпретатор, которым собран бандл (sys.base_prefix) → просто python3.
     """
     exe = sys.executable or ""
     if os.path.basename(exe).lower().startswith("python"):
         return exe
-    for cand in (os.environ.get("KSPEAK_PYTHON"),
+    for cand in (os.environ.get("QSPEAK_PYTHON"),
                  os.path.join(sys.base_prefix, "bin", "python3")):
         if cand and os.path.exists(cand):
             return cand

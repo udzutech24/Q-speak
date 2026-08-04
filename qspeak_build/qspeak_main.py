@@ -1,10 +1,10 @@
 import sys, os, multiprocessing
 
-# Alias-бандл: Contents/Resources/kspeak_main.py — симлинк на этот файл внутри
+# Alias-бандл: Contents/Resources/qspeak_main.py — симлинк на этот файл внутри
 # скилла, поэтому корень скилла берётся от него, а не хардкодится.
 SKILL = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
-# КРИТИЧНО для py2app: под бандлом sys.executable = сам K-speak.app. Любой
+# КРИТИЧНО для py2app: под бандлом sys.executable = сам QSpeak.app. Любой
 # multiprocessing/hf-download через spawn иначе перезапускает приложение,
 # ловит single-instance lock и роняет главный процесс. Направляем воркеров
 # на настоящий python.
@@ -21,10 +21,10 @@ os.chdir(SKILL)
 # Под py2app нет терминала — перенаправляем весь вывод в файл, чтобы видеть
 # работу диктовки/потока при отладке.
 try:
-    _log = open("/tmp/kspeak.log", "a", buffering=1, encoding="utf-8", errors="replace")
+    _log = open("/tmp/qspeak.log", "a", buffering=1, encoding="utf-8", errors="replace")
     sys.stdout = _log
     sys.stderr = _log
-    print("\n===== K-speak start =====", flush=True)
+    print("\n===== QSpeak start =====", flush=True)
 except Exception:
     pass
 
@@ -35,8 +35,8 @@ os.environ.setdefault("WHISPER_BEST_OF", "1")
 
 def _preauth_microphone():
     """Явно запросить доступ к микрофону через AVFoundation до старта диктовки.
-    Теперь процесс имеет identity бандла K-speak (Info.plist с NSMicrophoneUsageDescription),
-    поэтому системный диалог показывается корректно и решение атрибутируется K-speak."""
+    Теперь процесс имеет identity бандла QSpeak (Info.plist с NSMicrophoneUsageDescription),
+    поэтому системный диалог показывается корректно и решение атрибутируется QSpeak."""
     try:
         import AVFoundation
         from Foundation import NSRunLoop, NSDate

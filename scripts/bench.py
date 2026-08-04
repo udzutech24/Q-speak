@@ -1,6 +1,6 @@
 """Замер качества диктовки на собственном наборе эталонов.
 
-Набор копится через меню K-speak → «Поправить последнее…»:
+Набор копится через меню QSpeak → «Поправить последнее…»:
     ~/.config/whisper-skill/dataset/pairs.jsonl  +  wav-файлы рядом.
 
     python3 scripts/bench.py                          # текущая модель из конфига
@@ -71,7 +71,7 @@ def run(model: str | None) -> int:
     pairs = load_pairs()
     if not pairs:
         print(f"Набор пуст: {PAIRS_FILE}\n"
-              "Копи эталоны через меню K-speak → «Поправить последнее…»")
+              "Копи эталоны через меню QSpeak → «Поправить последнее…»")
         return 1
 
     from examples.common import transcribe

@@ -1,22 +1,22 @@
-"""py2app build for K-speak (alias mode).
+"""py2app build for QSpeak (alias mode).
 
 Сборка:
     python setup.py py2app -A
 
 Alias-режим: бандл ссылается на локальные файлы (не копирует mlx/numpy),
 но даёт СВОЙ бинарь-загрузчик с Info.plist → TCC атрибутирует микрофон
-приложению K-speak, а не голому python.
+приложению QSpeak, а не голому python.
 """
 from setuptools import setup
 
-APP = ["kspeak_main.py"]
+APP = ["qspeak_main.py"]
 
 OPTIONS = {
     "argv_emulation": False,
     "plist": {
-        "CFBundleName": "K-speak",
-        "CFBundleDisplayName": "K-speak",
-        "CFBundleIdentifier": "com.kspeak.dictation",
+        "CFBundleName": "QSpeak",
+        "CFBundleDisplayName": "QSpeak",
+        "CFBundleIdentifier": "com.qspeak.dictation",
         "CFBundleShortVersionString": "1.0",
         "CFBundleVersion": "1",
         "LSUIElement": True,
@@ -27,7 +27,7 @@ OPTIONS = {
 
 setup(
     app=APP,
-    name="K-speak",
+    name="QSpeak",
     options={"py2app": OPTIONS},
     setup_requires=["py2app"],
 )

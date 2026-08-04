@@ -1,25 +1,25 @@
 #!/bin/bash
-# K-speak — установка на чистый Mac (Apple Silicon).
+# QSpeak — установка на чистый Mac (Apple Silicon).
 #
-#   ./kspeak_build/install.sh          # поставить
-#   ./kspeak_build/install.sh --check  # проверить установленное
+#   ./qspeak_build/install.sh          # поставить
+#   ./qspeak_build/install.sh --check  # проверить установленное
 #
 # Модели (~4.4 ГБ) качаются сами при первой диктовке — в установку не входят,
 # поэтому standalone-бандл смысла не имеет: тяжёлое всё равно тянется с сети.
 set -euo pipefail
 
 SKILL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PY="${KSPEAK_PYTHON:-$(command -v python3 || true)}"
-APP="/Applications/K-speak.app"
+PY="${QSPEAK_PYTHON:-$(command -v python3 || true)}"
+APP="/Applications/QSpeak.app"
 CFG="$HOME/.config/whisper-skill"
-PLIST="$HOME/Library/LaunchAgents/com.kspeak.dictation.plist"
+PLIST="$HOME/Library/LaunchAgents/com.qspeak.dictation.plist"
 
 check() {
     echo "Приложение: $([ -d "$APP" ] && echo "$APP" || echo "НЕ УСТАНОВЛЕНО")"
     echo "Подпись:    $(codesign --verify "$APP" 2>&1 || echo "битая → codesign --force --deep --sign - $APP")"
-    echo "Автозапуск: $(launchctl list | grep com.kspeak.dictation || echo "не загружен")"
-    echo "Процессы:   $(pgrep -fl "K-speak|hud_mac" | tr '\n' ' ' || echo нет)"
-    echo "Лог:";       tail -5 /tmp/kspeak.log 2>/dev/null || echo "  пуст"
+    echo "Автозапуск: $(launchctl list | grep com.qspeak.dictation || echo "не загружен")"
+    echo "Процессы:   $(pgrep -fl "QSpeak|hud_mac" | tr '\n' ' ' || echo нет)"
+    echo "Лог:";       tail -5 /tmp/qspeak.log 2>/dev/null || echo "  пуст"
 }
 
 [ "${1:-}" = "--check" ] && { check; exit 0; }
@@ -35,17 +35,17 @@ echo "→ Python: $PY ($("$PY" -V))"
 
 # Конфиг и словарь заводим только если их ещё нет — переустановка не затирает настройки.
 mkdir -p "$CFG"
-[ -f "$CFG/voice_dictation.json" ] || cp "$SKILL/kspeak_build/default_config.json" "$CFG/voice_dictation.json"
+[ -f "$CFG/voice_dictation.json" ] || cp "$SKILL/qspeak_build/default_config.json" "$CFG/voice_dictation.json"
 [ -f "$CFG/vocabulary.txt" ] || printf '# Формат: Правильно = как слышится, ещё вариант\n' > "$CFG/vocabulary.txt"
 
 # Бандл в alias-режиме: ссылается на этот каталог, но даёт свой Info.plist —
-# TCC тогда спрашивает микрофон от имени K-speak, а не голого python.
-echo "→ Собираю K-speak.app"
-cd "$SKILL/kspeak_build"
+# TCC тогда спрашивает микрофон от имени QSpeak, а не голого python.
+echo "→ Собираю QSpeak.app"
+cd "$SKILL/qspeak_build"
 rm -rf build dist
 "$PY" setup.py py2app -A >/dev/null
 rm -rf "$APP"
-cp -R dist/K-speak.app "$APP"
+cp -R dist/QSpeak.app "$APP"
 # Любая правка содержимого бандла ломает подпись, а macOS после этого молча не
 # выдаёт Accessibility — галочка в настройках при этом выглядит включённой.
 codesign --force --deep --sign - "$APP"
@@ -58,10 +58,10 @@ cat > "$PLIST" <<PLIST_EOF
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.kspeak.dictation</string>
+    <string>com.qspeak.dictation</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$APP/Contents/MacOS/K-speak</string>
+        <string>$APP/Contents/MacOS/QSpeak</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -69,7 +69,7 @@ cat > "$PLIST" <<PLIST_EOF
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>KSPEAK_PYTHON</key>
+        <key>QSPEAK_PYTHON</key>
         <string>$PY</string>
     </dict>
 </dict>
@@ -82,14 +82,14 @@ sleep 5
 cat <<TXT
 
 ✅ Установлено. Осталось руками — macOS иначе не пустит:
-   1. Системные настройки → Конфиденциальность → Микрофон → включить K-speak
-   2. Там же → Универсальный доступ (Accessibility) → добавить и включить K-speak
+   1. Системные настройки → Конфиденциальность → Микрофон → включить QSpeak
+   2. Там же → Универсальный доступ (Accessibility) → добавить и включить QSpeak
       (без него не ловится хоткей и не работает вставка)
    3. Нажать правый Alt, сказать фразу, нажать ещё раз. Первая диктовка тянет
       модель ~4.4 ГБ — это одна минута ожидания, дальше локально и мгновенно.
 
    Хоткей и язык — в меню 🎙 в статус-баре. Словарь терминов: $CFG/vocabulary.txt
-   Лог: /tmp/kspeak.log · проверка установки: $0 --check
+   Лог: /tmp/qspeak.log · проверка установки: $0 --check
 
 TXT
 check
