@@ -1632,21 +1632,57 @@ def main_loop(cfg: dict, cfg_path: Path):
         # (armed), чтобы автоповтор/удержание не переключали запись многократно.
         armed = {"v": True}
 
+        # Хоткей из одного модификатора, который живёт и в комбинациях (⌃, ⌥ —
+        # Ctrl+C, ⌥+клик, Ctrl+стрелки): фронт нажатия ловить нельзя, иначе запись
+        # стартует от обычной работы. Для них срабатываем по ТАПУ — нажал и отпустил,
+        # не тронув по дороге ни другой клавиши, ни мыши. Правые модификаторы ни на
+        # что не назначены, поэтому им тап не нужен и остаётся мгновенный фронт.
+        tap_only = keys_needed <= {"ctrl", "alt", "cmd", "shift"}
+        tap = {"clean": False, "t0": 0.0}
+        TAP_MAX_SEC = 0.6
+
         def on_press(key):
             if key == keyboard.Key.esc and (state.is_recording or state.is_transcribing):
                 cancel_recording()
                 return
+            names = _canonical_keys(key)
             was = keys_needed.issubset(currently_pressed)
-            currently_pressed.update(_canonical_keys(key))
+            currently_pressed.update(names)
             now = keys_needed.issubset(currently_pressed)
+            if tap_only:
+                if now and not was:
+                    tap["clean"], tap["t0"] = True, time.time()
+                elif not (names & keys_needed):
+                    tap["clean"] = False      # пошла комбинация — это не тап
+                return
             if now and not was and armed["v"]:
                 armed["v"] = False
                 toggle()
 
         def on_release(key):
-            currently_pressed.difference_update(_canonical_keys(key))
+            names = _canonical_keys(key)
+            held = keys_needed.issubset(currently_pressed)
+            currently_pressed.difference_update(names)
+            if tap_only:
+                if held and (names & keys_needed):
+                    if tap["clean"] and time.time() - tap["t0"] <= TAP_MAX_SEC:
+                        toggle()
+                    tap["clean"] = False
+                return
             if not keys_needed.issubset(currently_pressed):
                 armed["v"] = True
+
+        def _mouse_dirties_tap(*_args):
+            # Ctrl+клик (контекстное меню) — тоже комбинация, не тап
+            tap["clean"] = False
+
+        if tap_only:
+            try:
+                from pynput import mouse
+                mouse.Listener(on_click=_mouse_dirties_tap,
+                               on_scroll=_mouse_dirties_tap).start()
+            except Exception as e:
+                logging.warning(f"mouse listener failed: {e}")
 
     with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
         try:
