@@ -200,6 +200,17 @@ def restart_self() -> None:
                 creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
                 close_fds=True,
             )
+    elif getattr(sys, "frozen", None) == "macosx_app" and Path(
+            "~/Library/LaunchAgents/com.kspeak.dictation.plist").expanduser().exists():
+        # Под py2app sys.executable — сам бандл K-speak: запустить его с
+        # "-m examples.voice_dictation" нельзя, argparse упадёт на этих
+        # аргументах и приложение не поднимется. Перезапуск отдаём launchd —
+        # он же вернёт правильный PATH с homebrew (иначе ffmpeg not found).
+        subprocess.Popen(
+            ["/bin/sh", "-c",
+             f"sleep 1; launchctl kickstart -k gui/{os.getuid()}/com.kspeak.dictation"],
+            start_new_session=True, close_fds=True,
+        )
     else:
         subprocess.Popen(
             [sys.executable, "-m", "examples.voice_dictation"],
@@ -258,13 +269,31 @@ class AudioRecorder:
             # RMS обычная речь еле шевелит полоски.
             self.level = min(1.0, float(np.sqrt(np.abs(indata).mean())) * 3.0)
 
-        self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype="float32",
-            callback=callback,
-        )
-        self._stream.start()
+        def _open():
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype="float32",
+                callback=callback,
+            )
+            self._stream.start()
+
+        try:
+            _open()
+        except Exception as e:
+            # PortAudio кэширует список устройств с момента импорта. Сменили
+            # вход (воткнули вебкамеру, ушли в наушники) — открытие падает
+            # с -9986 навсегда, пока процесс не перезапустят. Переинициализация
+            # даёт актуальный список без перезапуска приложения.
+            print(f"⚠️  Микрофон не открылся ({e}) — переинициализирую PortAudio")
+            sd._terminate()
+            sd._initialize()
+            _open()
+        try:
+            dev = sd.query_devices(kind="input")
+            print(f"🎙  Вход: {dev['name']} @ {self.sample_rate} Гц")
+        except Exception:
+            pass
 
     def stop(self) -> Optional[str]:
         """Остановить запись и сохранить в WAV. Вернуть путь к файлу."""
@@ -614,6 +643,35 @@ def save_to_history(text: str) -> None:
         logging.error(f"history write failed: {e}")
 
 
+def save_last_take(wav_path: str, text: str) -> None:
+    """Придержать последнюю запись рядом с расшифровкой.
+
+    Без этого эталон брать неоткуда: wav удаляется сразу после расшифровки, а
+    в истории лежит только то, что Whisper *услышал*. Пункт меню «Поправить
+    последнее» превращает эту пару в обучающий пример.
+    """
+    try:
+        import shutil
+        d = default_config_path().parent
+        shutil.copy(wav_path, d / "last.wav")
+        (d / "last.json").write_text(
+            json.dumps({"wav": str(d / "last.wav"), "asr": text}, ensure_ascii=False),
+            encoding="utf-8")
+    except Exception as e:
+        logging.error(f"save_last_take failed: {e}")
+
+
+def last_history_entry() -> str:
+    """Текст последней диктовки — для пункта меню «Вставить последнее»."""
+    try:
+        blocks = history_path().read_text(encoding="utf-8").split("\n## ")
+    except OSError:
+        return ""
+    if len(blocks) < 2:
+        return ""
+    return "\n".join(blocks[-1].splitlines()[1:]).strip()
+
+
 def save_clipboard() -> Optional[str]:
     """Снимок текстового содержимого буфера для последующего восстановления.
 
@@ -913,12 +971,25 @@ def _play_wav_bytes(wav: bytes) -> None:
 
 # macOS: системные звуки через afplay. Синтез через sounddevice здесь не годится —
 # он конфликтует с уже открытым InputStream микрофона.
-MAC_SOUND_START = "/System/Library/Sounds/Tink.aiff"
-MAC_SOUND_STOP = "/System/Library/Sounds/Bottle.aiff"
+# Purr на старт (мягкий, тянется) + Morse на стоп (резкий обрыв): пара читается
+# как «поехали» / «всё». Submarine на стопе звучал как начало, Glass занят под
+# уведомления VS Code. Переопределяется в конфиге:
+# "sounds": {"start": "/System/Library/Sounds/Morse.aiff", ...},
+# громкость — "sound_volume": 0..1. Список системных: ls /System/Library/Sounds
+MAC_SOUND_START = "/System/Library/Sounds/Purr.aiff"
+MAC_SOUND_STOP = "/System/Library/Sounds/Morse.aiff"
 MAC_SOUND_DONE = "/System/Library/Sounds/Pop.aiff"
+_SOUND_CFG: dict = {}
 
 
-def _play_mac_sound(path: str, volume: str = "0.6") -> None:
+def configure_sounds(cfg: dict) -> None:
+    """Забрать звуки и громкость из конфига — play_*_beep зовутся без cfg."""
+    _SOUND_CFG.update(cfg.get("sounds") or {})
+    _SOUND_CFG["volume"] = str(cfg.get("sound_volume", 1.0))
+
+
+def _play_mac_sound(path: str, volume: str = "") -> None:
+    volume = volume or _SOUND_CFG.get("volume", "1.0")
     try:
         subprocess.Popen(["afplay", "-v", volume, path],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -928,22 +999,24 @@ def _play_mac_sound(path: str, volume: str = "0.6") -> None:
 
 def play_start_beep() -> None:
     if platform.system() == "Darwin":
-        _play_mac_sound(MAC_SOUND_START)
+        _play_mac_sound(_SOUND_CFG.get("start", MAC_SOUND_START))
     elif _BEEP_WAV_START is not None:
         _play_wav_bytes(_BEEP_WAV_START)
 
 
 def play_stop_beep() -> None:
     if platform.system() == "Darwin":
-        _play_mac_sound(MAC_SOUND_STOP)
+        _play_mac_sound(_SOUND_CFG.get("stop", MAC_SOUND_STOP))
     elif _BEEP_WAV_STOP is not None:
         _play_wav_bytes(_BEEP_WAV_STOP)
 
 
 def play_done_beep() -> None:
-    """Третий сигнал — текст вставлен, можно продолжать."""
+    """Третий сигнал — текст вставлен, можно продолжать. Тише прочих: звучит
+    в момент, когда пользователь уже смотрит на вставленный текст."""
     if platform.system() == "Darwin":
-        _play_mac_sound(MAC_SOUND_DONE, volume="0.4")
+        quiet = float(_SOUND_CFG.get("volume", 1.0)) * 0.6
+        _play_mac_sound(_SOUND_CFG.get("done", MAC_SOUND_DONE), volume=str(quiet))
 
 
 def play_dual_beep(f1: int, f2: int, dur_ms: int = 60, gap_ms: int = 40) -> None:
@@ -1187,12 +1260,17 @@ def main_loop(cfg: dict, cfg_path: Path):
     # Optional — silently disables if Tk unavailable. На macOS всегда no-op
     # (см. scripts/cursor_indicator.py — Tk thread-safety issue).
     cursor_ind = None
+    # Меню в статус-баре живёт в HUD-процессе и шлёт команды сюда. enabled —
+    # только в памяти: тумблер на время, а не настройка на всю жизнь.
+    menu_state = {"enabled": True}
     if platform.system() == "Darwin" and cfg.get("show_hud", True):
         # На macOS Tk-индикатор не работает (main-thread), поэтому отдельный
         # процесс с Cocoa-панелью внизу экрана.
         try:
             from scripts.hud_mac import MacHUD
-            cursor_ind = MacHUD()
+            # lambda, а не сама функция: _on_menu_command определён ниже, а
+            # команды приходят уже после сборки main_loop.
+            cursor_ind = MacHUD(on_command=lambda c: _on_menu_command(c))
             cursor_ind.start()
         except Exception as e:
             logging.error(f"macOS HUD init failed: {e}")
@@ -1252,6 +1330,8 @@ def main_loop(cfg: dict, cfg_path: Path):
                     )
 
     def start_recording():
+        if not menu_state["enabled"]:   # тумблер в меню — глушим на входе, а не в каждом хоткее
+            return
         with state_lock:
             if state.is_recording or state.is_transcribing:
                 return
@@ -1336,6 +1416,7 @@ def main_loop(cfg: dict, cfg_path: Path):
                     # Пишем в историю ДО вставки: если фокус ушёл не туда или
                     # вставка сорвалась — текст всё равно не потерян.
                     save_to_history(text)
+                    save_last_take(wav_path, text)
 
                     # AI-правка (аналог «AI mode» у Wispr Flow): пунктуация,
                     # заглавные, чистка оговорок. Смысл не меняется.
@@ -1409,6 +1490,41 @@ def main_loop(cfg: dict, cfg_path: Path):
             stop_and_transcribe()
         else:
             start_recording()
+
+    def _on_menu_command(cmd: str) -> None:
+        """Клик в меню статус-бара (протокол — в scripts/hud_mac.py)."""
+        parts = cmd.split(maxsplit=2)
+        if parts[0] == "enabled" and len(parts) == 2:
+            menu_state["enabled"] = parts[1] == "1"
+            if not menu_state["enabled"] and state.is_recording:
+                stop_and_transcribe()
+            print(f"🎛 Диктовка {'включена' if menu_state['enabled'] else 'выключена'}")
+        elif parts[0] == "set" and len(parts) == 3:
+            key, raw = parts[1], parts[2]
+            val = {"auto": None, "0": False, "1": True}.get(raw, raw)
+            cfg[key] = val
+            try:
+                cur = load_config(cfg_path)
+                cur[key] = val
+                write_config(cfg_path, cur)
+            except Exception as e:
+                logging.error(f"config write failed: {e}")
+            print(f"🎛 {key} → {val}")
+            if key == "model":
+                print("🔁 Перезапуск под новую модель...")
+                restart_self()
+        elif cmd == "paste_last":
+            text = last_history_entry()
+            if text:
+                copy_to_clipboard(text)
+                time.sleep(0.15)
+                paste_from_clipboard()
+                print(f"📋 Вставлено из истории: {text[:60]}")
+        elif parts[0] == "log":
+            print(f"🎛 {cmd[4:]}")
+        elif cmd == "quit_app":
+            print("👋 Выход из меню")
+            os._exit(0)
 
     hotkey_str = cfg["hotkey"]
     print(f"🎤 Whisper Voice Dictation активна")
@@ -1618,6 +1734,7 @@ def main():
         if not _check_macos_accessibility():
             return 1
 
+    configure_sounds(cfg)
     return main_loop(cfg, cfg_path)
 
 

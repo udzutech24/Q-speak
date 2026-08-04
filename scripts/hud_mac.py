@@ -10,10 +10,15 @@ voice_dictation он занят pynput-листенером. Родитель ш
     L<0..1>       → текущий уровень звука
     quit          → выйти
 
+Обратно в stdout (клики по меню в статус-баре):
+    enabled 0|1        · set language auto|ru|en · set model <имя>
+    set play_sound 0|1 · paste_last · quit_app
+
 Проверка руками:  python3 scripts/hud_mac.py --demo
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import subprocess
@@ -31,13 +36,90 @@ ACCENT_A = (0.10, 1.00, 0.55)     # сочный зелёный — левый �
 ACCENT_B = (0.25, 0.95, 0.85)     # бирюза — правый край
 ACCENT_WORK = (0.45, 0.80, 1.00)  # голубой — расшифровываем
 
+CFG_DIR = os.path.expanduser("~/.config/whisper-skill")
+CFG_FILE = os.path.join(CFG_DIR, "voice_dictation.json")
+HISTORY_FILE = os.path.join(CFG_DIR, "history.md")
+VOCAB_FILE = os.path.join(CFG_DIR, "vocabulary.txt")
+
+LANGS = [("Авто", "auto"), ("Русский", "ru"), ("English", "en")]
+MODELS = [("large-v3 (точная)", "mlx-community/whisper-large-v3-mlx"),
+          ("large-v3-turbo (быстрая)", "mlx-community/whisper-large-v3-turbo")]
+# Средняя скорость: слепой набор ~40 слов/мин, речь ~130. Разница = экономия.
+TYPING_WPM, SPEAK_WPM = 40.0, 130.0
+
+
+def _read_cfg() -> dict:
+    try:
+        with open(CFG_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+DATASET_DIR = os.path.join(CFG_DIR, "dataset")
+PAIRS_FILE = os.path.join(DATASET_DIR, "pairs.jsonl")
+
+
+def save_correction() -> str:
+    """Показать распознанное, дать поправить и сложить пару «аудио + правда».
+
+    Единственный источник эталона: сам Whisper не знает, где ошибся. Диалог —
+    через osascript, чтобы не городить Cocoa-окно ради одного текстового поля.
+    """
+    try:
+        with open(os.path.join(CFG_DIR, "last.json"), encoding="utf-8") as f:
+            last = json.load(f)
+    except Exception:
+        return "нет последней записи"
+    if not os.path.exists(last.get("wav", "")):
+        return "аудио последней записи не сохранилось"
+
+    # ensure_ascii=False обязателен: \uXXXX AppleScript не понимает и падает на
+    # разборе. Переводы строк тоже недопустимы внутри его строкового литерала.
+    shown = json.dumps(last["asr"].replace("\n", " "), ensure_ascii=False)
+    script = ('display dialog "Что было сказано на самом деле?" '
+              f'default answer {shown} with title "K-speak" '
+              'buttons {"Отмена", "Сохранить"} default button "Сохранить"')
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if r.returncode != 0:                       # Отмена
+        return "отменено"
+    truth = r.stdout.split("text returned:", 1)[-1].strip()
+    if not truth or truth == last["asr"]:
+        return "правок нет"
+
+    os.makedirs(DATASET_DIR, exist_ok=True)
+    name = time.strftime("%Y%m%d-%H%M%S") + ".wav"
+    subprocess.run(["cp", last["wav"], os.path.join(DATASET_DIR, name)], check=True)
+    with open(PAIRS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"wav": name, "truth": truth, "asr": last["asr"]},
+                           ensure_ascii=False) + "\n")
+    return "сохранено"
+
+
+def stats_today(path: str = HISTORY_FILE, today: str = "") -> str:
+    """Слова за сегодня из history.md + сэкономленное против набора руками."""
+    today = today or time.strftime("%Y-%m-%d")
+    words, counting = 0, False
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("## "):
+                    counting = line[3:].startswith(today)
+                elif counting:
+                    words += len(line.split())
+    except OSError:
+        return "Сегодня: истории нет"
+    saved = words * (1 / TYPING_WPM - 1 / SPEAK_WPM)
+    return f"Сегодня: {words} слов · ~{saved:.0f} мин сэкономлено"
+
 
 # ─── дочерний процесс: само окно ────────────────────────────────────────────
 
 def _run_child() -> int:
     from AppKit import (
         NSApplication, NSApplicationActivationPolicyAccessory, NSBackingStoreBuffered,
-        NSBezierPath, NSColor, NSPanel, NSScreen, NSTimer, NSView,
+        NSBezierPath, NSColor, NSMenu, NSMenuItem, NSPanel, NSScreen, NSStatusBar,
+        NSTimer, NSVariableStatusItemLength, NSView,
         NSWindowCollectionBehaviorCanJoinAllSpaces,
         NSWindowCollectionBehaviorFullScreenAuxiliary,
         NSWindowCollectionBehaviorStationary,
@@ -46,7 +128,8 @@ def _run_child() -> int:
     from Foundation import NSMakeRect, NSMakePoint, NSObject
     import objc
 
-    state = {"mode": "hidden", "level": 0.0, "smooth": 0.0, "shown": 0.0, "t": 0.0}
+    state = {"mode": "hidden", "level": 0.0, "smooth": 0.0, "shown": 0.0, "t": 0.0,
+             "enabled": True, "title": ""}
 
     class HUDView(NSView):
         def drawRect_(self, rect):
@@ -132,6 +215,111 @@ def _run_child() -> int:
     view = HUDView.alloc().initWithFrame_(panel.contentView().bounds())
     panel.setContentView_(view)
 
+    # ─── меню в статус-баре ─────────────────────────────────────────────────
+    # Живёт здесь же: этот процесс уже Cocoa и уже на главном потоке, а в
+    # родителе главный поток занят pynput-листенером. Клики уходят в stdout.
+
+    def _emit(cmd: str) -> None:
+        try:
+            sys.stdout.write(cmd + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    class MenuTarget(NSObject):
+        def toggleEnabled_(self, sender):
+            state["enabled"] = not state["enabled"]
+            _emit(f"enabled {1 if state['enabled'] else 0}")
+
+        def pickLang_(self, sender):
+            _emit(f"set language {sender.representedObject()}")
+
+        def pickModel_(self, sender):
+            _emit(f"set model {sender.representedObject()}")
+
+        def toggleSounds_(self, sender):
+            _emit(f"set play_sound {0 if _read_cfg().get('play_sound', True) else 1}")
+
+        def openVocab_(self, sender):
+            subprocess.Popen(["open", "-t", VOCAB_FILE])
+
+        def openHistory_(self, sender):
+            subprocess.Popen(["open", "-t", HISTORY_FILE])
+
+        def pasteLast_(self, sender):
+            _emit("paste_last")
+
+        def correctLast_(self, sender):
+            # stderr ребёнка уходит в DEVNULL, поэтому результат — в общий лог
+            # через родителя.
+            _emit(f"log правка эталона: {save_correction()}")
+
+        def quitApp_(self, sender):
+            _emit("quit_app")
+
+        def menuWillOpen_(self, menu):
+            cfg = _read_cfg()
+            mi["stats"].setTitle_(stats_today())
+            try:
+                with open(PAIRS_FILE, encoding="utf-8") as f:
+                    n = sum(1 for _ in f)
+            except OSError:
+                n = 0
+            mi["correct"].setTitle_(f"Поправить последнее… (эталонов: {n})")
+            mi["onoff"].setTitle_("Диктовка включена" if state["enabled"]
+                                  else "Диктовка выключена")
+            mi["onoff"].setState_(1 if state["enabled"] else 0)
+            mi["sounds"].setState_(1 if cfg.get("play_sound", True) else 0)
+            for it in mi["langs"]:
+                it.setState_(1 if (cfg.get("language") or "auto") == it.representedObject() else 0)
+            for it in mi["models"]:
+                it.setState_(1 if cfg.get("model") == it.representedObject() else 0)
+
+    target = MenuTarget.alloc().init()
+
+    def _item(title, action, obj=None):
+        it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
+        it.setTarget_(target)
+        if obj is not None:
+            it.setRepresentedObject_(obj)
+        return it
+
+    def _submenu(parent_menu, title, pairs, action):
+        head = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
+        sub = NSMenu.alloc().init()
+        items = []
+        for label, value in pairs:
+            it = _item(label, action, value)
+            sub.addItem_(it)
+            items.append(it)
+        head.setSubmenu_(sub)
+        parent_menu.addItem_(head)
+        return items
+
+    menu = NSMenu.alloc().init()
+    menu.setDelegate_(target)
+    mi = {"stats": _item(stats_today(), None),
+          "onoff": _item("Диктовка включена", "toggleEnabled:"),
+          "sounds": _item("Звуки", "toggleSounds:"),
+          "correct": _item("Поправить последнее…", "correctLast:")}
+    menu.addItem_(mi["stats"])
+    menu.addItem_(NSMenuItem.separatorItem())
+    menu.addItem_(mi["onoff"])
+    mi["langs"] = _submenu(menu, "Язык", LANGS, "pickLang:")
+    mi["models"] = _submenu(menu, "Модель", MODELS, "pickModel:")
+    menu.addItem_(mi["sounds"])
+    menu.addItem_(NSMenuItem.separatorItem())
+    menu.addItem_(_item("Вставить последнее", "pasteLast:"))
+    menu.addItem_(mi["correct"])
+    menu.addItem_(_item("Открыть словарь", "openVocab:"))
+    menu.addItem_(_item("Открыть историю", "openHistory:"))
+    menu.addItem_(NSMenuItem.separatorItem())
+    menu.addItem_(_item("Выход", "quitApp:"))
+
+    status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
+        NSVariableStatusItemLength)
+    status_item.setMenu_(menu)
+
     def _stdin_reader():
         for line in sys.stdin:
             cmd = line.strip()
@@ -161,6 +349,12 @@ def _run_child() -> int:
                 app.terminate_(None)
                 return
             state["t"] += 1 / 30
+            # значок в баре меняется только на главном потоке — отсюда, не из stdin
+            want_title = {"recording": "🔴", "transcribing": "⏳"}.get(
+                state["mode"], "🎙" if state["enabled"] else "⏸")
+            if want_title != state["title"]:
+                state["title"] = want_title
+                status_item.button().setTitle_(want_title)
             # сглаживание громкости: сырой RMS дёргается и полоски мельтешат
             state["smooth"] += (state["level"] - state["smooth"]) * 0.35
             want = 0.0 if state["mode"] == "hidden" else 1.0
@@ -188,19 +382,34 @@ def _run_child() -> int:
 
 # ─── родитель: обёртка с API как у CursorIndicator ──────────────────────────
 
-def _real_python() -> str:
-    """Под py2app sys.executable — сам бандл K-speak, дочерний процесс так не поднять."""
+def real_python() -> str:
+    """Под py2app sys.executable — сам бандл K-speak, дочерний процесс так не поднять.
+
+    Порядок: KSPEAK_PYTHON из окружения (его пишет install.sh в LaunchAgent) →
+    интерпретатор, которым собран бандл (sys.base_prefix) → просто python3.
+    """
     exe = sys.executable or ""
     if os.path.basename(exe).lower().startswith("python"):
         return exe
-    return "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3"
+    for cand in (os.environ.get("KSPEAK_PYTHON"),
+                 os.path.join(sys.base_prefix, "bin", "python3")):
+        if cand and os.path.exists(cand):
+            return cand
+    return "python3"
+
+
+_real_python = real_python   # старое имя — на случай внешних вызовов
 
 
 class MacHUD:
-    """Тот же интерфейс, что у CursorIndicator, плюс set_level()."""
+    """Тот же интерфейс, что у CursorIndicator, плюс set_level().
 
-    def __init__(self) -> None:
+    on_command(str) — клики по меню в статус-баре (см. протокол вверху файла).
+    """
+
+    def __init__(self, on_command=None) -> None:
         self._proc: subprocess.Popen | None = None
+        self._on_command = on_command
 
     def start(self) -> None:
         if self._proc:
@@ -208,12 +417,23 @@ class MacHUD:
         try:
             self._proc = subprocess.Popen(
                 [_real_python(), os.path.abspath(__file__), "--child"],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, bufsize=1,
                 cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             )
+            threading.Thread(target=self._read_commands, daemon=True).start()
         except Exception:
             self._proc = None
+
+    def _read_commands(self) -> None:
+        for line in self._proc.stdout:
+            cmd = line.strip()
+            if not cmd or not self._on_command:
+                continue
+            try:
+                self._on_command(cmd)
+            except Exception as e:
+                print(f"[hud] команда {cmd!r} упала: {e}", flush=True)
 
     def _send(self, cmd: str) -> None:
         p = self._proc
@@ -259,7 +479,25 @@ def _demo() -> None:
     hud.stop()
 
 
+def _selftest() -> None:
+    """Проверка разбора истории: считаем только сегодняшние блоки."""
+    import tempfile
+    hist = ("\n## 2026-08-02 10:00:00\nвчера три слова\n"
+            "\n## 2026-08-03 09:00:00\nсегодня ровно четыре слова\n"
+            "\n## 2026-08-03 11:00:00\nещё два\n")
+    with tempfile.NamedTemporaryFile("w", suffix=".md", encoding="utf-8", delete=False) as f:
+        f.write(hist)
+    out = stats_today(f.name, today="2026-08-03")
+    assert "6 слов" in out, out                       # 4 + 2, вчерашние не в счёт
+    assert stats_today("/нет/такого", today="x").startswith("Сегодня: истории нет")
+    os.unlink(f.name)
+    print("ok:", out)
+
+
 if __name__ == "__main__":
     if "--child" in sys.argv:
         sys.exit(_run_child())
-    _demo()
+    if "--selftest" in sys.argv:
+        _selftest()
+    else:
+        _demo()

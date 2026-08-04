@@ -1,20 +1,22 @@
 import sys, os, multiprocessing
 
+# Alias-бандл: Contents/Resources/kspeak_main.py — симлинк на этот файл внутри
+# скилла, поэтому корень скилла берётся от него, а не хардкодится.
+SKILL = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
 # КРИТИЧНО для py2app: под бандлом sys.executable = сам K-speak.app. Любой
 # multiprocessing/hf-download через spawn иначе перезапускает приложение,
 # ловит single-instance lock и роняет главный процесс. Направляем воркеров
 # на настоящий python.
-_REAL_PY = "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3"
+sys.path.insert(0, SKILL)
+from scripts.hud_mac import real_python
 try:
-    multiprocessing.set_executable(_REAL_PY)
+    multiprocessing.set_executable(real_python())
 except Exception:
     pass
 multiprocessing.freeze_support()
 
-SKILL = "/Users/alekseya/.claude/skills/whisper-skill"
 os.chdir(SKILL)
-if SKILL not in sys.path:
-    sys.path.insert(0, SKILL)
 
 # Под py2app нет терминала — перенаправляем весь вывод в файл, чтобы видеть
 # работу диктовки/потока при отладке.
@@ -40,6 +42,8 @@ def _preauth_microphone():
         from Foundation import NSRunLoop, NSDate
         AT = AVFoundation.AVMediaTypeAudio
         st = AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(AT)
+        # 0 не спрашивали · 1 запрещено политикой · 2 отказано · 3 разрешено
+        print(f"[mic preauth] статус доступа к микрофону: {st}", flush=True)
         if st == 3:  # уже разрешено
             return
         done = {"v": False}
