@@ -65,6 +65,7 @@ DEFAULT_CONFIG = {
     "log_file": None,                    # путь к файлу лога или null = stdout
     "trim_silence_ms": 200,              # обрезать тишину в начале/конце записи
     "min_duration_ms": 300,              # игнорировать слишком короткие записи (промахи кнопкой)
+    "unload_after_idle_min": 15,         # выгрузить модель из памяти после N минут простоя (0 = держать всегда)
     # macOS-специфика: pystray/Tk известно жрут CPU в фоне на macOS
     # (NSRunLoop в non-main thread + Tk thread-safety). Этот флаг автоматически
     # отключает show_tray и show_cursor_indicator на macOS, оставляя CLI-вывод
@@ -374,8 +375,9 @@ def _common_prefix_words(a: list, b: list) -> list:
 
 
 CLAUDE_BIN_CANDIDATES = [
-    "/Users/alekseya/.local/bin/claude",
+    # PATH-имя первым: на Windows это claude.cmd, на Unix — бинарь из PATH.
     "claude",
+    str(Path.home() / ".local" / "bin" / "claude"),
 ]
 
 
@@ -610,6 +612,57 @@ def _split_on_silence(audio, sr: int, chunk_sec: float = 28.0, search_from: floa
         parts.append(audio[pos:end])
         pos = end
     return parts
+
+
+# ─── Память: выгрузка модели по простою ─────────────────────────────────────
+
+_unload_timer = None
+
+
+def _clear_mlx_cache() -> None:
+    """Отдать системе буферный кэш MLX. Веса остаются — это только то, что
+    MLX держит про запас между вызовами и что копится от диктовки к диктовке."""
+    try:
+        import mlx.core as mx
+        mx.clear_cache()
+    except Exception:
+        pass
+
+
+def _release_model() -> None:
+    """Выкинуть веса Whisper из памяти. Модель (~3 ГБ) висит между диктовками;
+    на забитой машине её страницы уезжают в swap, и следующая расшифровка ждёт
+    подкачку с диска (05.08.2026: 2865 → 212 кадров/с, ответ 1,1с → 30,8с)."""
+    try:  # mlx: своя одиночная ячейка под модель
+        from mlx_whisper.transcribe import ModelHolder
+        ModelHolder.model = None
+    except Exception:
+        pass
+    try:  # faster-whisper / whisperx: кэш в common
+        from examples.common import _loaded_models
+        _loaded_models.clear()
+    except Exception:
+        pass
+    import gc
+    gc.collect()
+    _clear_mlx_cache()
+    print("♻️  Модель выгружена из памяти (простой)", flush=True)
+
+
+def _after_dictation(cfg: dict) -> None:
+    """После каждой расшифровки: отдать кэш и перевести таймер выгрузки.
+    `unload_after_idle_min: 0` в конфиге — держать модель всегда."""
+    global _unload_timer
+    _clear_mlx_cache()
+    if _unload_timer:
+        _unload_timer.cancel()
+        _unload_timer = None
+    mins = cfg.get("unload_after_idle_min", 15)
+    if not mins:
+        return
+    _unload_timer = threading.Timer(mins * 60, _release_model)
+    _unload_timer.daemon = True
+    _unload_timer.start()
 
 
 def transcribe_long(wav_path: str, cfg: dict) -> str:
@@ -1555,6 +1608,7 @@ def main_loop(cfg: dict, cfg_path: Path):
                     cursor_ind.hide()
                 try: os.unlink(wav_path)
                 except: pass
+                _after_dictation(cfg)
 
         threading.Thread(target=work, daemon=True).start()
 

@@ -20,5 +20,6 @@
   "ai_cleanup": false,
   "ai_timeout_sec": 30,
   "show_hud": true,
-  "keep_in_clipboard": true
+  "keep_in_clipboard": true,
+  "unload_after_idle_min": 15
 }
