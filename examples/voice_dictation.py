@@ -575,6 +575,156 @@ def apply_vocabulary(text: str, rules: list) -> str:
     return text
 
 
+def add_vocabulary_rule(target: str, form: str) -> bool:
+    """Дописать правило «правильно = как слышится» в vocabulary.txt.
+
+    Термин в файле уже есть — кривой вариант уходит в его строку, иначе
+    заводится новая. False, если такой вариант там уже был.
+    """
+    p = default_config_path().parent / "vocabulary.txt"
+    lines = p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith("#") or "=" not in ln:
+            continue
+        t, variants = ln.split("=", 1)
+        if t.strip().lower() != target.strip().lower():
+            continue
+        if form.lower() in [v.strip().lower() for v in variants.split(",")]:
+            return False
+        lines[i] = f"{ln.rstrip()}, {form}"
+        break
+    else:
+        lines.append(f"{target} = {form}")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
+
+
+def _last_asr_terms() -> list:
+    """Слова последней диктовки — то, что Whisper *услышал*, до правок руками.
+    Биграммы тоже: термин часто разваливается надвое («сейф грип»)."""
+    try:
+        d = default_config_path().parent
+        asr = json.loads((d / "last.json").read_text(encoding="utf-8"))["asr"]
+    except Exception:
+        return []
+    w = re.findall(r"[^\W\d_]+", asr, flags=re.UNICODE)
+    return w + [f"{a} {b}" for a, b in zip(w, w[1:])]
+
+
+def _osa_dialog(body: str):
+    """Показать диалог от лица активного приложения.
+
+    Через System Events нельзя: это фоновый процесс, его окна наверх не
+    выходят — диалоги просто висели невидимыми (поймано 07.08.2026).
+    """
+    return subprocess.run(
+        ["osascript",
+         "-e", "set fa to path to frontmost application as text",
+         "-e", f"tell application fa to {body}"],
+        capture_output=True, text=True, timeout=120)
+
+
+def _ask(question: str, default: str = "") -> str:
+    """Однострочный диалог с полем ввода."""
+    if platform.system() != "Darwin":
+        return ""
+    # ensure_ascii=False обязателен: \uXXXX AppleScript не разбирает и падает
+    q, d = json.dumps(question, ensure_ascii=False), json.dumps(default, ensure_ascii=False)
+    r = _osa_dialog(f'display dialog {q} default answer {d} '
+                    'with title "QSpeak — словарь" '
+                    'buttons {"Отмена", "Добавить"} default button "Добавить"')
+    if r.returncode != 0:
+        return ""
+    return r.stdout.split("text returned:", 1)[-1].strip()
+
+
+def _choose(items: list, prompt: str) -> str:
+    """Выбор из списка вместо ввода: правка часто на другом алфавите
+    («синкани» → «Xingyu»), похожесть по буквам там не находит ничего, а
+    печатать кривой вариант руками — ровно та работа, от которой уходим."""
+    if platform.system() != "Darwin" or not items:
+        return ""
+    lst = ", ".join(json.dumps(i, ensure_ascii=False) for i in items[:60])
+    r = _osa_dialog(f'choose from list {{{lst}}} '
+                    f'with prompt {json.dumps(prompt, ensure_ascii=False)} '
+                    'with title "QSpeak — словарь"')
+    out = r.stdout.strip()
+    return "" if r.returncode != 0 or out == "false" else out
+
+
+def copy_selection() -> str:
+    """Cmd+C по текущему выделению → текст. Буфер возвращаем как был."""
+    saved = save_clipboard()
+    copy_to_clipboard("")          # пустой буфер = «ничего не выделено», а не старый текст
+    try:
+        subprocess.run(                     # key code 8 = физическая C, раскладка не важна
+            ["osascript", "-e",
+             'tell application "System Events" to key code 8 using command down'],
+            check=True, capture_output=True, timeout=2)
+    except Exception as e:
+        logging.warning(f"copy selection failed: {e}")
+    time.sleep(0.2)
+    text = (_get_clipboard_text() or "").strip()
+    restore_clipboard(saved)
+    return text
+
+
+def learn_selected_word() -> None:
+    """Выделенное слово → правило словаря. Направление определяем сами.
+
+    Слово нашлось в последней диктовке — значит выделено то, что Whisper
+    услышал, и спросить надо правильное написание. Не нашлось — значит это
+    уже исправленная руками форма, а кривую берём из той же диктовки по
+    похожести, и диалог не нужен вовсе.
+    """
+    sel = " ".join(copy_selection().split())
+    if not sel or len(sel) > 60:
+        notify("Сначала выдели слово, потом двойной тап правого ⌘")
+        return
+    terms = _last_asr_terms()
+    if any(t.lower() == sel.lower() for t in terms):
+        target, form = _ask("Как это писать правильно?", sel), sel
+        if not target or target.lower() == sel.lower():
+            return
+    else:
+        import difflib
+        near = difflib.get_close_matches(sel.lower(), [t.lower() for t in terms], n=1, cutoff=0.55)
+        target = sel
+        form = near[0] if near else _choose(terms, f"Что диктовка услышала вместо «{sel}»?")
+        if not form:
+            return
+    msg = (f"{target} ← {form}" if add_vocabulary_rule(target, form)
+           else f"«{form}» уже в словаре")
+    print(f"📚 Словарь: {msg}")
+    notify(msg)
+
+
+def learn_from_last_pair() -> str:
+    """Последняя пара из «Поправить последнее» → правила словаря.
+    Слова, которые ты в диалоге изменил, и есть криво слышимые термины."""
+    import difflib
+    p = default_config_path().parent / "dataset" / "pairs.jsonl"
+    try:
+        last = json.loads(p.read_text(encoding="utf-8").strip().splitlines()[-1])
+    except Exception:
+        return "эталонов нет"
+    a = re.findall(r"[^\W\d_]+", last["asr"], flags=re.UNICODE)
+    b = re.findall(r"[^\W\d_]+", last["truth"], flags=re.UNICODE)
+    added = []
+    ops = difflib.SequenceMatcher(a=[w.lower() for w in a], b=[w.lower() for w in b]).get_opcodes()
+    for op, i1, i2, j1, j2 in ops:
+        # длинные куски — это переписанная фраза, а не термин; в словарь им нельзя
+        if op != "replace" or i2 - i1 > 3 or j2 - j1 > 3:
+            continue
+        form, target = " ".join(a[i1:i2]), " ".join(b[j1:j2])
+        if add_vocabulary_rule(target, form):
+            added.append(f"{target} ← {form}")
+    if added:
+        notify(", ".join(added), title="📚 Словарь")
+    return ", ".join(added) if added else "новых правил нет"
+
+
 def _split_on_silence(audio, sr: int, chunk_sec: float = 28.0, search_from: float = 0.78):
     """Нарезать длинное аудио на куски ~chunk_sec, разрезая в самом тихом месте.
 
@@ -1651,6 +1801,8 @@ def main_loop(cfg: dict, cfg_path: Path):
                 time.sleep(0.15)
                 paste_from_clipboard()
                 print(f"📋 Вставлено из истории: {text[:60]}")
+        elif cmd == "vocab_learn":
+            print(f"📚 Словарь: {learn_from_last_pair()}")
         elif parts[0] == "log":
             print(f"🎛 {cmd[4:]}")
         elif cmd == "quit_app":
@@ -1737,6 +1889,28 @@ def main_loop(cfg: dict, cfg_path: Path):
                                on_scroll=_mouse_dirties_tap).start()
             except Exception as e:
                 logging.warning(f"mouse listener failed: {e}")
+
+    # Двойной тап правого ⌘ — выделенное слово в словарь. Правый ⌥ не годится:
+    # его двойной тап забрал Claude Desktop под Quick Entry (поймано 07.08.2026).
+    # Если правый ⌘ занят под саму диктовку — не мешаем.
+    if "cmd_r" not in keys_needed:
+        _dbl = {"t": 0.0}
+        # базовый обработчик — через переменную, а НЕ дефолтным аргументом:
+        # pynput смотрит на сигнатуру и во второй параметр кладёт свой injected
+        _base_press = on_press
+
+        def on_press(key):                      # noqa: F811
+            if "cmd_r" in _canonical_keys(key):
+                now = time.time()
+                if now - _dbl["t"] <= 0.8:
+                    _dbl["t"] = 0.0
+                    threading.Thread(target=learn_selected_word, daemon=True).start()
+                else:
+                    _dbl["t"] = now
+            else:
+                # ⌘+буква (Cmd+C, Cmd+V) — это комбинация, а не тап по словарю
+                _dbl["t"] = 0.0
+            return _base_press(key)
 
     with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
         try:

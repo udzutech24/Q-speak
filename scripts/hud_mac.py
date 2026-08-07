@@ -296,7 +296,11 @@ def _run_child() -> int:
         def correctLast_(self, sender):
             # stderr ребёнка уходит в DEVNULL, поэтому результат — в общий лог
             # через родителя.
-            _emit(f"log правка эталона: {save_correction()}")
+            res = save_correction()
+            _emit(f"log правка эталона: {res}")
+            if res == "сохранено":
+                # правку в словарь превращает родитель — разбор правил живёт там
+                _emit("vocab_learn")
 
         def quitApp_(self, sender):
             _emit("quit_app")
