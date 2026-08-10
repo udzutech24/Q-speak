@@ -1,4 +1,4 @@
-# install_autostart.ps1
+﻿# install_autostart.ps1
 #
 # Регистрирует voice dictation в автостарте текущего пользователя
 # через HKCU\Software\Microsoft\Windows\CurrentVersion\Run.

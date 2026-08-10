@@ -1,4 +1,4 @@
-# install_shortcut.ps1
+﻿# install_shortcut.ps1
 #
 # Создаёт ярлык "Whisper Voice.lnk" в Start Menu (и опционально на рабочем столе),
 # указывающий на launcher\voice_dictation_silent.vbs с нашей иконкой.

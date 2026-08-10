@@ -1,4 +1,4 @@
-# uninstall_autostart.ps1 — снимает автостарт диктовки.
+﻿# uninstall_autostart.ps1 — снимает автостарт диктовки.
 
 [CmdletBinding()]
 param()

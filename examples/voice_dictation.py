@@ -84,7 +84,9 @@ def load_config(path: Optional[Path] = None) -> dict:
     path = path or default_config_path()
     if not path.exists():
         return dict(DEFAULT_CONFIG)
-    user_cfg = json.loads(path.read_text(encoding="utf-8"))
+    # utf-8-sig: терпим BOM, если конфиг создан старой версией install.ps1
+    # (PS 5.1 Set-Content -Encoding UTF8 пишет UTF-8 с BOM).
+    user_cfg = json.loads(path.read_text(encoding="utf-8-sig"))
     cfg = dict(DEFAULT_CONFIG)
     cfg.update(user_cfg)
     return cfg
@@ -549,7 +551,7 @@ def load_vocabulary() -> list:
         if not p.exists():
             return []
         rules = []
-        for ln in p.read_text(encoding="utf-8").splitlines():
+        for ln in p.read_text(encoding="utf-8-sig").splitlines():
             ln = ln.strip()
             if not ln or ln.startswith("#") or "=" not in ln:
                 continue
@@ -582,7 +584,7 @@ def add_vocabulary_rule(target: str, form: str) -> bool:
     заводится новая. False, если такой вариант там уже был.
     """
     p = default_config_path().parent / "vocabulary.txt"
-    lines = p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+    lines = p.read_text(encoding="utf-8-sig").splitlines() if p.exists() else []
     for i, ln in enumerate(lines):
         if ln.strip().startswith("#") or "=" not in ln:
             continue
@@ -605,7 +607,7 @@ def _last_asr_terms() -> list:
     Биграммы тоже: термин часто разваливается надвое («сейф грип»)."""
     try:
         d = default_config_path().parent
-        asr = json.loads((d / "last.json").read_text(encoding="utf-8"))["asr"]
+        asr = json.loads((d / "last.json").read_text(encoding="utf-8-sig"))["asr"]
     except Exception:
         return []
     w = re.findall(r"[^\W\d_]+", asr, flags=re.UNICODE)
@@ -706,7 +708,7 @@ def learn_from_last_pair() -> str:
     import difflib
     p = default_config_path().parent / "dataset" / "pairs.jsonl"
     try:
-        last = json.loads(p.read_text(encoding="utf-8").strip().splitlines()[-1])
+        last = json.loads(p.read_text(encoding="utf-8-sig").strip().splitlines()[-1])
     except Exception:
         return "эталонов нет"
     a = re.findall(r"[^\W\d_]+", last["asr"], flags=re.UNICODE)
@@ -886,7 +888,7 @@ def save_last_take(wav_path: str, text: str) -> None:
 def last_history_entry() -> str:
     """Текст последней диктовки — для пункта меню «Вставить последнее»."""
     try:
-        blocks = history_path().read_text(encoding="utf-8").split("\n## ")
+        blocks = history_path().read_text(encoding="utf-8-sig").split("\n## ")
     except OSError:
         return ""
     if len(blocks) < 2:
