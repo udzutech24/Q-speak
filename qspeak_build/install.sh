@@ -65,6 +65,10 @@ cat > "$PLIST" <<PLIST_EOF
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <!-- Без Interactive macOS держит фоновый процесс на энергоэффективных ядрах:
+         расшифровка идёт в разы медленнее (у Алины 1,9 против 35 кадров/с). -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
