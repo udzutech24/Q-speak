@@ -801,6 +801,34 @@ def _release_model() -> None:
     print("♻️  Модель выгружена из памяти (простой)", flush=True)
 
 
+# Потолок расшифровки: обычная укладывается в 2–5 с, самая длинная запись
+# (max_duration_sec=120) — в полминуты. Всё, что дольше, — уже не медленно, а
+# насмерть.
+STUCK_TRANSCRIBE_SEC = 180
+
+
+def _restart_app(reason: str) -> None:
+    """MLX иногда не возвращается из eval: поток стоит в mlx::core::Event::wait
+    — ждёт GPU-событие, которое не придёт (18.08.2026, забитый своп). Внутри
+    процесса это не лечится — поток не убить и не разбудить, а состояние
+    «идёт расшифровка» блокирует диктовку. Поднимаем новую копию и выходим."""
+    print(f"⛔ {reason} — перезапускаю", flush=True)
+    notify("Расшифровка зависла — перезапускаюсь")
+    app = "/Applications/QSpeak.app"
+    try:
+        if platform.system() == "Darwin" and app in sys.executable:
+            # Сначала умереть, потом стартовать: пока старая копия жива,
+            # LaunchServices просто активирует её вместо запуска новой, а
+            # single-instance lock ещё занят.
+            subprocess.Popen(["/bin/sh", "-c", f"sleep 2; open -a '{app}'"],
+                             start_new_session=True)
+        else:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        print(f"❌ перезапуск не удался: {e}", flush=True)
+    os._exit(1)
+
+
 def _after_dictation(cfg: dict) -> None:
     """После каждой расшифровки: отдать кэш и перевести таймер выгрузки.
     `unload_after_idle_min: 0` в конфиге — держать модель всегда."""
@@ -1609,6 +1637,13 @@ def main_loop(cfg: dict, cfg_path: Path):
                 if state.is_transcribing:
                     cancelled["v"] = True
                     print("✖ Отменяю расшифровку")
+                    # Отпускаем интерфейс сразу, не дожидаясь потока: если он
+                    # залип в MLX, флаг остался бы поднятым навсегда и HUD
+                    # висел бы на экране, а новая запись не стартовала.
+                    state.is_transcribing = False
+                    tray.set_state("idle")
+                    if cursor_ind:
+                        cursor_ind.hide()
                 return
             state.is_recording = False
         if auto_stop["t"]:
@@ -1669,10 +1704,17 @@ def main_loop(cfg: dict, cfg_path: Path):
         state.is_transcribing = True
 
         def work():
+            wd = None
             try:
                 if not warmup_done.is_set():
                     print("⏳ Waiting for model warmup to finish...")
                     warmup_done.wait()
+                # Сторож ставится после прогрева: первая загрузка модели
+                # (скачивание ~3 ГБ) законно долгая, перезапускать её нельзя.
+                wd = threading.Timer(STUCK_TRANSCRIBE_SEC, _restart_app,
+                                     args=("расшифровка зависла",))
+                wd.daemon = True
+                wd.start()
                 t0 = time.time()
                 text = apply_vocabulary(transcribe_long(wav_path, cfg), load_vocabulary())
                 elapsed = time.time() - t0
@@ -1754,6 +1796,8 @@ def main_loop(cfg: dict, cfg_path: Path):
             except Exception as e:
                 print(f"❌ Transcription failed: {e}")
             finally:
+                if wd:
+                    wd.cancel()
                 state.is_transcribing = False
                 tray.set_state("idle")
                 if cursor_ind:
