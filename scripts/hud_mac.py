@@ -136,7 +136,7 @@ def _run_child() -> int:
     from AppKit import (
         NSApplication, NSApplicationActivationPolicyAccessory, NSBackingStoreBuffered,
         NSBezierPath, NSColor, NSMenu, NSMenuItem, NSPanel, NSScreen, NSStatusBar,
-        NSTimer, NSVariableStatusItemLength, NSView,
+        NSEvent, NSTimer, NSVariableStatusItemLength, NSView,
         NSWindowCollectionBehaviorCanJoinAllSpaces,
         NSWindowCollectionBehaviorFullScreenAuxiliary,
         NSWindowCollectionBehaviorStationary,
@@ -237,8 +237,26 @@ def _run_child() -> int:
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 
-    scr = NSScreen.mainScreen().frame()
-    frame = NSMakeRect((scr.size.width - PANEL_W) / 2, BOTTOM_MARGIN, PANEL_W, PANEL_H)
+    def panel_origin():
+        """Левый нижний угол пилюли по ЭКРАНУ, где сейчас курсор.
+
+        Считался один раз на старте и по main-дисплею: стоило отключить
+        внешний монитор (или сменить масштаб), как посчитанный по широкой
+        ширине x оставлял правый край пилюли за границей узкого экрана —
+        вместе с крестиком «отменить», и отменить запись было нечем."""
+        pt = NSEvent.mouseLocation()
+        scr = NSScreen.mainScreen()
+        for s in NSScreen.screens():
+            f = s.frame()
+            if (f.origin.x <= pt.x < f.origin.x + f.size.width
+                    and f.origin.y <= pt.y < f.origin.y + f.size.height):
+                scr = s
+                break
+        f = scr.frame()
+        return (f.origin.x + (f.size.width - PANEL_W) / 2, f.origin.y + BOTTOM_MARGIN)
+
+    ox, oy = panel_origin()
+    frame = NSMakeRect(ox, oy, PANEL_W, PANEL_H)
     panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
         frame, NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
         NSBackingStoreBuffered, False)
@@ -446,8 +464,11 @@ def _run_child() -> int:
             panel.setIgnoresMouseEvents_(state["mode"] == "hidden")
             # окно не прячем через orderOut: первый кадр после показа стоил
             # заметного подтормаживания. Невидимая панель с alpha 0 не мешает.
-            panel.setFrameOrigin_(NSMakePoint(
-                frame.origin.x, BOTTOM_MARGIN - RISE * (1.0 - e)))
+            if state["mode"] != "hidden" or p > 0.0:
+                # позицию берём заново на каждом показе — экран мог смениться,
+                # пока пилюля была скрыта
+                ox, oy = panel_origin()
+                panel.setFrameOrigin_(NSMakePoint(ox, oy - RISE * (1.0 - e)))
             if p > 0.0:
                 view.setNeedsDisplay_(True)
 
