@@ -258,6 +258,22 @@ def _close_stream(stream) -> None:
         logging.warning(f"stream close failed: {e}")
 
 
+def _lid_closed_input(sd):
+    """Крышка MacBook закрыта — встроенный микрофон отдаёт тишину, а macOS
+    оставляет его входом по умолчанию; Whisper на тишине пишет «Thank you.»
+    (22.09.2026). Тогда берём любой другой вход, иначе None = системный."""
+    try:
+        out = subprocess.run(["ioreg", "-r", "-k", "AppleClamshellState", "-d", "1"],
+                             capture_output=True, text=True, timeout=1).stdout
+        if '"AppleClamshellState" = Yes' in out:
+            for i, d in enumerate(sd.query_devices()):
+                if d["max_input_channels"] > 0 and "MacBook" not in d["name"]:
+                    return i
+    except Exception:
+        pass
+    return None
+
+
 class AudioRecorder:
     def __init__(self, sample_rate: int = 16000, channels: int = 1):
         self.sample_rate = sample_rate
@@ -288,6 +304,7 @@ class AudioRecorder:
                 channels=self.channels,
                 dtype="float32",
                 callback=callback,
+                device=_lid_closed_input(sd),
             )
             self._stream.start()
 
@@ -303,7 +320,7 @@ class AudioRecorder:
             sd._initialize()
             _open()
         try:
-            dev = sd.query_devices(kind="input")
+            dev = sd.query_devices(self._stream.device)
             print(f"🎙  Вход: {dev['name']} @ {self.sample_rate} Гц")
         except Exception:
             pass
